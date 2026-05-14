@@ -4,6 +4,7 @@ import { useAgentConfig } from "./useAgentConfig.tsx";
 import {
   ReactAgentCard,
   LlmRetryCard,
+  QueryRetryCard,
   LlmRateLimiterCard,
   ContextCompactCard,
   ToolResultCompactCard,
@@ -31,6 +32,8 @@ function AgentConfigPage() {
   } = useAgentConfig();
 
   const llmRetryEnabled = Form.useWatch("llm_retry_enabled", form) ?? true;
+  const queryRetryEnabled =
+    Form.useWatch(["query_retry", "enabled"], form) ?? false;
   const maxInputLength = Form.useWatch("max_input_length", form) ?? 0;
 
   if (loading) {
@@ -72,6 +75,8 @@ function AgentConfigPage() {
             />
 
             <LlmRetryCard llmRetryEnabled={llmRetryEnabled} />
+
+            <QueryRetryCard queryRetryEnabled={queryRetryEnabled} />
 
             <LlmRateLimiterCard />
 

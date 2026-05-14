@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, AsyncGenerator
@@ -33,6 +34,7 @@ from .command_dispatch import (
     run_command_path,
 )
 from .query_error_dump import write_query_error_dump
+from .retry_classifier import is_query_retryable
 from .session import SafeJSONSession
 from .stream_boundary import normalize_reasoning_boundary_stream
 from .task_progress import attach_task_progress
@@ -448,9 +450,8 @@ def _strip_internal_follow_up_messages_from_state(
             if isinstance(msg_payload, dict)
             else None
         )
-        if (
-            isinstance(metadata, dict)
-            and metadata.get(_INTERNAL_FOLLOW_UP_METADATA_KEY)
+        if isinstance(metadata, dict) and metadata.get(
+            _INTERNAL_FOLLOW_UP_METADATA_KEY,
         ):
             removed += 1
             continue
@@ -557,6 +558,15 @@ async def _generate_and_store_suggestions(
             )
     except Exception as e:
         logger.warning("Suggestion generation task failed: %s", e)
+
+
+@dataclass
+class _RetryState:
+    """重试执行期间需要与调用方共享的可变状态。"""
+
+    agent: SWEAgent | None = None
+    session_state_loaded: bool = False
+    task_completed: bool = True
 
 
 class AgentRunner(Runner):
@@ -701,15 +711,746 @@ class AgentRunner(Runner):
             None,
         )
 
+    async def _init_trace(
+        self,
+        request: AgentRequest,
+        msgs,
+        session_id: str,
+    ) -> str | None:
+        """初始化追踪上下文，返回 trace_id 或 None。"""
+        if not has_trace_manager():
+            return None
+        try:
+            trace_mgr = get_trace_manager()
+            if not trace_mgr.enabled:
+                return None
+            user_id_for_trace = getattr(request, "user_id", "") or ""
+            channel_for_trace = getattr(
+                request,
+                "channel",
+                DEFAULT_CHANNEL,
+            )
+            source_id_for_trace = getattr(
+                request,
+                "source_id",
+                None,
+            ) or getattr(
+                request,
+                "channel_meta",
+                {},
+            ).get(
+                "source_id",
+                "default",
+            )
+            user_message = _get_last_user_text(msgs)
+
+            # 提取用户名称：先尝试 request 属性，再尝试 request.state
+            user_name_for_trace = getattr(
+                request,
+                "user_name",
+                None,
+            ) or getattr(
+                getattr(request, "state", None),
+                "user_name",
+                None,
+            )
+            # 提取 BBK 标识符：先尝试 request 属性，再尝试 request.state
+            bbk_id_for_trace = getattr(
+                request,
+                "bbk_id",
+                None,
+            ) or getattr(
+                getattr(request, "state", None),
+                "bbk_id",
+                None,
+            )
+
+            return await trace_mgr.start_trace(
+                user_id=user_id_for_trace,
+                session_id=session_id,
+                channel=channel_for_trace,
+                source_id=source_id_for_trace,
+                user_message=user_message,
+                user_name=user_name_for_trace,
+                bbk_id=bbk_id_for_trace,
+            )
+        except Exception as e:
+            logger.warning("Failed to start trace: %s", e)
+            return None
+
+    @staticmethod
+    def _extract_retry_config(
+        agent_config,
+    ) -> tuple[bool, int, float, float]:
+        """从 agent 配置中提取重试参数。
+
+        Returns:
+            (retry_enabled, max_retries, backoff_base, backoff_cap)
+        """
+        query_retry_config = getattr(
+            getattr(agent_config, "running", None),
+            "query_retry",
+            None,
+        )
+        if not query_retry_config:
+            return False, 0, 2.0, 30.0
+        return (
+            getattr(query_retry_config, "enabled", False),
+            getattr(query_retry_config, "max_retries", 0),
+            getattr(query_retry_config, "backoff_base", 2.0),
+            getattr(query_retry_config, "backoff_cap", 30.0),
+        )
+
+    async def _build_mcp_clients_for_request(
+        self,
+        agent_config,
+        request: AgentRequest,
+    ) -> list:
+        """根据 agent 配置和请求上下文构建并连接 MCP 客户端。"""
+        cookie_header = getattr(request, "cookie", None)
+        passthrough_headers = dict[str, str](
+            get_current_passthrough_headers() or {},
+        )
+        if cookie_header:
+            passthrough_headers["cookie"] = cookie_header
+        return await _build_and_connect_mcp_clients(
+            agent_config.mcp,
+            passthrough_headers=passthrough_headers or None,
+        )
+
+    async def _setup_chat_and_turn(
+        self,
+        request: AgentRequest,
+        session_id: str,
+        user_id: str,
+        channel: str,
+        msgs,
+        name: str,
+        turn_id: str,
+    ):
+        """初始化 Chat 管理，返回 chat 实例（ChatManager 不可用时为 None）。"""
+        chat = None
+        if self._chat_manager is not None:
+            logger.debug(
+                f"Runner: Calling get_or_create_chat for "
+                f"session_id={session_id}, user_id={user_id}, "
+                f"channel={channel}, name={name}",
+            )
+            chat = await self._chat_manager.get_or_create_chat(
+                session_id,
+                user_id,
+                channel,
+                name=name,
+                meta={"agent_id": self.agent_id},
+            )
+            logger.debug(f"Runner: Got chat: {chat.id}")
+            request.channel_meta = {
+                **(getattr(request, "channel_meta", None) or {}),
+                "chat_id": chat.id,
+                "turn_id": turn_id,
+            }
+        else:
+            logger.warning(
+                f"ChatManager is None! Cannot auto-register chat for "
+                f"session_id={session_id}",
+            )
+        return chat
+
+    async def _run_single_query_attempt(
+        self,
+        agent: SWEAgent,
+        turn_msgs: list,
+        session_id: str,
+        agent_config,
+        original_user_message: str,
+        validation_config,
+        confirmed_turn_index: int,
+        trace_id: str | None,
+        request: AgentRequest,
+    ) -> AsyncGenerator[tuple, None]:
+        """执行单次查询尝试，包含 agent 调用和后置校验。
+
+        调用方需在外部先完成 session state 加载和 system prompt rebuild。
+        作为异步生成器，先 yield 所有 agent 产出的 (msg, last)，
+        最后 yield 一个 (task_completed, last_validation_result) 元组
+        作为最终结果。
+        """
+        agent.rebuild_sys_prompt()
+        channel_meta = getattr(request, "channel_meta", {}) or {}
+        resume_id = channel_meta.get(
+            "post_turn_validation_resume_id",
+        )
+        task_completed = True
+
+        if resume_id:
+            pending_continuation = await consume_pending_continuation(
+                validation_id=resume_id,
+                session_id=session_id,
+                tenant_id=self.tenant_id,
+            )
+            if pending_continuation is None:
+                yield Msg(
+                    name="Friday",
+                    role="assistant",
+                    content="续跑请求已过期或不存在，请重新发起任务。",
+                ), True
+                yield False, None
+                return
+
+            original_user_message = (
+                pending_continuation.user_message or original_user_message
+            )
+            confirmed_turn_index = (
+                pending_continuation.confirmed_turn_index + 1
+            )
+            turn_msgs = [
+                _build_internal_follow_up_msg(
+                    pending_continuation.follow_up_prompt,
+                ),
+            ]
+
+        auto_follow_up_turns = 0
+        max_auto_turns = (
+            _resolve_max_auto_turns(validation_config)
+            if validation_config is not None
+            else 0
+        )
+        last_validation_result = None
+
+        while True:
+            async for msg, last in self._enforce_query_timeout(
+                stream_printing_messages(
+                    agents=[agent],
+                    coroutine_task=agent(turn_msgs),
+                ),
+                session_id=session_id,
+                agent=agent,
+            ):
+                yield msg, last
+
+            assistant_response = _extract_assistant_response(agent)
+            task_completed = True
+            last_validation_result = None
+            if (
+                assistant_response
+                and original_user_message
+                and validation_config is not None
+                and getattr(
+                    validation_config,
+                    "enabled",
+                    False,
+                )
+            ):
+                last_validation_result = await validate_task_completion(
+                    user_message=original_user_message,
+                    assistant_response=assistant_response,
+                    agent_id=self.agent_id,
+                    timeout_seconds=getattr(
+                        validation_config,
+                        "timeout_seconds",
+                        8.0,
+                    ),
+                    user_message_max_length=getattr(
+                        validation_config,
+                        "user_message_max_length",
+                        300,
+                    ),
+                    assistant_response_max_length=getattr(
+                        validation_config,
+                        "assistant_response_max_length",
+                        1200,
+                    ),
+                )
+                task_completed = last_validation_result.completed
+
+                if (
+                    not last_validation_result.completed
+                    and last_validation_result.follow_up_prompt
+                    and auto_follow_up_turns < max_auto_turns
+                ):
+                    auto_follow_up_turns += 1
+                    turn_msgs = [
+                        _build_internal_follow_up_msg(
+                            last_validation_result.follow_up_prompt,
+                        ),
+                    ]
+                    logger.info(
+                        "Post-turn validation scheduled automatic "
+                        "follow-up turn %d/%d for session %s: %s",
+                        auto_follow_up_turns,
+                        max_auto_turns,
+                        session_id,
+                        last_validation_result.reason or "continue",
+                    )
+                    continue
+
+            break
+
+        # 处理后置校验未完成时的续跑存储
+        await self._store_pending_if_needed(
+            task_completed,
+            last_validation_result,
+            validation_config,
+            confirmed_turn_index,
+            original_user_message,
+            auto_follow_up_turns,
+            max_auto_turns,
+            session_id,
+            agent,
+        )
+
+        # 建议生成
+        await self._generate_suggestions_if_needed(
+            agent_config,
+            task_completed,
+            agent,
+            original_user_message,
+            session_id,
+        )
+
+        # 通过 Monitor API 写入 model_output 到 ES
+        await self._index_model_output_if_needed(trace_id, agent)
+
+        # End trace with success status
+        await self._end_trace_if_needed(trace_id, TraceStatus.COMPLETED)
+
+        yield task_completed, last_validation_result
+
+    async def _store_pending_if_needed(
+        self,
+        task_completed: bool,
+        last_validation_result,
+        validation_config,
+        confirmed_turn_index: int,
+        original_user_message: str,
+        auto_follow_up_turns: int,
+        max_auto_turns: int,
+        session_id: str,
+        agent: SWEAgent,
+    ) -> None:
+        """后置校验未完成时，存储续跑上下文。"""
+        if (
+            task_completed
+            or last_validation_result is None
+            or not last_validation_result.follow_up_prompt
+        ):
+            return
+        max_confirmed_turns = _resolve_max_confirmed_turns(
+            validation_config,
+        )
+        if confirmed_turn_index < max_confirmed_turns:
+            await store_pending_continuation(
+                session_id=session_id,
+                user_message=original_user_message,
+                assistant_response=(_extract_assistant_response(agent)),
+                reason=last_validation_result.reason,
+                follow_up_prompt=(last_validation_result.follow_up_prompt),
+                tenant_id=self.tenant_id,
+                confirmed_turn_index=confirmed_turn_index,
+            )
+            logger.info(
+                "Post-turn validation pending confirmation "
+                "after automatic turns %d/%d; confirmed "
+                "turn %d/%d for session %s: %s",
+                auto_follow_up_turns,
+                max_auto_turns,
+                confirmed_turn_index + 1,
+                max_confirmed_turns,
+                session_id,
+                last_validation_result.reason or "continue",
+            )
+        else:
+            logger.info(
+                "Post-turn validation reached confirmed turn "
+                "limit %d for session %s",
+                max_confirmed_turns,
+                session_id,
+            )
+
+    async def _generate_suggestions_if_needed(
+        self,
+        agent_config,
+        task_completed: bool,
+        agent: SWEAgent,
+        original_user_message: str,
+        session_id: str,
+    ) -> None:
+        """任务完成时生成建议。"""
+        suggestions_config = getattr(
+            agent_config.running,
+            "suggestions",
+            None,
+        )
+        if (
+            not task_completed
+            or suggestions_config is None
+            or not getattr(suggestions_config, "enabled", False)
+            or getattr(suggestions_config, "mode", None)
+            != SuggestionMode.BACKEND_GENERATE
+        ):
+            return
+        assistant_response = _extract_assistant_response(agent)
+        if assistant_response and original_user_message:
+            await _generate_and_store_suggestions(
+                session_id,
+                original_user_message,
+                assistant_response,
+                suggestions_config,
+            )
+
+    async def _index_model_output_if_needed(
+        self,
+        trace_id: str | None,
+        agent: SWEAgent | None,
+    ) -> None:
+        """通过 Monitor API 写入 model_output 到 ES。"""
+        if not trace_id or agent is None:
+            return
+        logger.debug(
+            "Preparing to index model output: trace_id=%s, agent=%s",
+            trace_id,
+            type(agent).__name__,
+        )
+        assistant_response = _extract_assistant_response(agent)
+        logger.debug(
+            "Extracted assistant response: trace_id=%s, response_len=%d",
+            trace_id,
+            len(assistant_response) if assistant_response else 0,
+        )
+        if assistant_response:
+            await _index_model_output_to_monitor(
+                trace_id,
+                assistant_response,
+            )
+        else:
+            logger.warning(
+                "No assistant response to index: trace_id=%s",
+                trace_id,
+            )
+
+    @staticmethod
+    async def _end_trace_if_needed(
+        trace_id: str | None,
+        status: TraceStatus,
+        error: str | None = None,
+    ) -> None:
+        """结束追踪记录。"""
+        if not trace_id or not has_trace_manager():
+            return
+        try:
+            trace_mgr = get_trace_manager()
+            kwargs: dict[str, Any] = {"status": status}
+            if error is not None:
+                kwargs["error"] = error
+            await trace_mgr.end_trace(trace_id, **kwargs)
+        except Exception as trace_err:
+            logger.warning("Failed to end trace: %s", trace_err)
+
+    async def _handle_query_error(
+        self,
+        exc: Exception,
+        trace_id: str | None,
+    ) -> None:
+        """处理查询异常：结束追踪。"""
+        await self._end_trace_if_needed(
+            trace_id,
+            TraceStatus.ERROR,
+            error=str(exc),
+        )
+
+    async def _create_and_init_agent(
+        self,
+        agent_config,
+        env_context,
+        mcp_clients: list,
+        request_context: dict,
+        trace_id: str | None,
+        *,
+        should_setup_skill_detector: bool,
+    ) -> SWEAgent:
+        """创建并初始化 Agent 实例。"""
+        created_agent = SWEAgent(
+            agent_config=agent_config,
+            env_context=env_context,
+            mcp_clients=mcp_clients,
+            memory_manager=self.memory_manager,
+            request_context=request_context,
+            workspace_dir=self.workspace_dir,
+            task_tracker=self._task_tracker,
+        )
+        await created_agent.register_mcp_clients()
+        created_agent.set_console_output_enabled(enabled=False)
+        if should_setup_skill_detector and trace_id:
+            await created_agent.setup_skill_detector(trace_id)
+        return created_agent
+
+    @staticmethod
+    def _build_request_context(
+        session_id: str,
+        user_id: str,
+        channel: str,
+        chat,
+        turn_id: str,
+        agent_id: str,
+        auth_token: str | None,
+        approved_tool_call: dict | None,
+    ) -> dict[str, str]:
+        """构建 Agent 请求上下文。"""
+        ctx: dict[str, str] = {
+            "session_id": session_id,
+            "user_id": user_id,
+            "channel": channel,
+            "chat_id": chat.id if chat is not None else "",
+            "turn_id": turn_id,
+            "agent_id": agent_id,
+        }
+        if auth_token:
+            ctx["auth_token"] = auth_token
+        if approved_tool_call:
+            ctx["forced_tool_call_json"] = json.dumps(
+                approved_tool_call,
+                ensure_ascii=False,
+            )
+        return ctx
+
+    @staticmethod
+    def _compute_retry_backoff(
+        retry_attempt: int,
+        backoff_cap: float,
+        backoff_base: float,
+    ) -> float:
+        """计算重试退避时间。"""
+        return min(
+            backoff_cap,
+            backoff_base * (2 ** (retry_attempt - 1)),
+        )
+
+    async def _resolve_resume_continuation(
+        self,
+        request: AgentRequest,
+        session_id: str,
+        original_user_message: str,
+    ) -> tuple[str, int, list, bool] | None:
+        """解析续跑请求，返回 (user_message, confirmed_turn_index, turn_msgs, expired)。
+
+        如果没有续跑请求返回 None；如果续跑已过期则 expired=True。
+        """
+        channel_meta = getattr(request, "channel_meta", {}) or {}
+        resume_id = channel_meta.get("post_turn_validation_resume_id")
+        if not resume_id:
+            return None
+
+        pending_continuation = await consume_pending_continuation(
+            validation_id=resume_id,
+            session_id=session_id,
+            tenant_id=self.tenant_id,
+        )
+        if pending_continuation is None:
+            return original_user_message, 0, [], True
+
+        user_message = (
+            pending_continuation.user_message or original_user_message
+        )
+        confirmed_turn_index = pending_continuation.confirmed_turn_index + 1
+        turn_msgs = [
+            _build_internal_follow_up_msg(
+                pending_continuation.follow_up_prompt,
+            ),
+        ]
+        return user_message, confirmed_turn_index, turn_msgs, False
+
+    def _resolve_chat_name(self, msgs) -> str:
+        """从消息列表中解析聊天名称。"""
+        if not msgs:
+            return "New Chat"
+        content = msgs[0].get_text_content()
+        if content:
+            return content[:10]
+        return "Media Message"
+
+    def _annotate_exception_with_dump(
+        self,
+        exc: Exception,
+        debug_dump_path: str | None,
+    ) -> None:
+        """将 debug dump 路径注解到异常对象上。"""
+        if not debug_dump_path:
+            return
+        setattr(exc, "debug_dump_path", debug_dump_path)
+        if hasattr(exc, "add_note"):
+            exc.add_note(f"(Details:  {debug_dump_path})")
+        suffix = f"\n(Details:  {debug_dump_path})"
+        exc.args = (
+            (f"{exc.args[0]}{suffix}" if exc.args else suffix.strip()),
+        ) + exc.args[1:]
+
+    async def _save_state_before_retry(
+        self,
+        agent: SWEAgent | None,
+        session_state_loaded: bool,
+        session_id: str,
+        skip_history: bool,
+        user_id: str,
+    ) -> None:
+        """重试前保存当前会话状态。"""
+        if agent is None or not session_state_loaded:
+            return
+        try:
+            await asyncio.wait_for(
+                self.save_job_session_state(
+                    agent,
+                    session_id,
+                    skip_history,
+                    user_id,
+                ),
+                timeout=QUERY_CLEANUP_TIMEOUT,
+            )
+        except Exception as save_err:
+            logger.warning(
+                "Failed to save state before retry: %s",
+                save_err,
+            )
+
+    async def _run_safe_cleanup(
+        self,
+        agent: SWEAgent | None,
+        session_state_loaded: bool,
+        session_id: str,
+        skip_history: bool,
+        user_id: str,
+        chat,
+        mcp_clients: list | None,
+    ) -> None:
+        """安全执行清理操作，忽略 CancelledError。
+
+        每个清理步骤都使用 asyncio.wait_for 设置超时，
+        防止数据库不可达等情况永久阻塞请求。
+        """
+        try:
+            if agent is not None and session_state_loaded:
+                await asyncio.wait_for(
+                    self.save_job_session_state(
+                        agent,
+                        session_id,
+                        skip_history,
+                        user_id,
+                    ),
+                    timeout=QUERY_CLEANUP_TIMEOUT,
+                )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Runner finally: session state save timed out "
+                "(session_id=%s, timeout=%.0fs)",
+                session_id,
+                QUERY_CLEANUP_TIMEOUT,
+            )
+        except asyncio.CancelledError:
+            logger.debug(
+                "Runner finally: session state save cancelled (session_id=%s)",
+                session_id,
+            )
+        try:
+            if self._chat_manager is not None and chat is not None:
+                await asyncio.wait_for(
+                    self._chat_manager.update_chat(chat),
+                    timeout=QUERY_CLEANUP_TIMEOUT,
+                )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Runner finally: chat update timed out "
+                "(session_id=%s, timeout=%.0fs)",
+                session_id,
+                QUERY_CLEANUP_TIMEOUT,
+            )
+        except asyncio.CancelledError:
+            logger.debug(
+                "Runner finally: chat update cancelled (session_id=%s)",
+                session_id,
+            )
+        try:
+            # 关闭本次请求创建的所有 MCP 客户端
+            if mcp_clients:
+                await asyncio.wait_for(
+                    _cleanup_mcp_clients(mcp_clients),
+                    timeout=QUERY_CLEANUP_TIMEOUT,
+                )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Runner finally: MCP cleanup timed out "
+                "(session_id=%s, timeout=%.0fs)",
+                session_id,
+                QUERY_CLEANUP_TIMEOUT,
+            )
+        except asyncio.CancelledError:
+            logger.debug(
+                "Runner finally: MCP cleanup cancelled (session_id=%s)",
+                session_id,
+            )
+
+    async def _extract_and_store_qa(
+        self,
+        agent_config,
+        task_completed: bool,
+        agent: SWEAgent | None,
+        chat,
+        query: str | None,
+    ) -> None:
+        """Q&A 内容提取钩子：从助手响应中提取关键内容并存储。"""
+        if (
+            agent_config is None
+            or not task_completed
+            or not agent_config.running.suggestions.enabled
+            or agent_config.running.suggestions.mode
+            != SuggestionMode.QA_EXTRACTION_ONLY
+            or chat is None
+        ):
+            return
+
+        assistant_response = _extract_assistant_response(agent)
+        user_message = query
+
+        if assistant_response and user_message:
+            from ..suggestions.service import extract_key_content
+            from ..suggestions.store import store_qa_content
+
+            config = agent_config.running.suggestions
+            extracted_user = user_message[: config.user_message_max_length]
+            extracted_assistant = extract_key_content(
+                assistant_response,
+                max_length=min(
+                    config.qa_content_total_max_length - len(extracted_user),
+                    config.assistant_response_max_length,
+                ),
+            )
+
+            await store_qa_content(
+                chat_id=chat.id,
+                user_message=extracted_user,
+                assistant_response=extracted_assistant,
+                tenant_id=self.tenant_id,
+            )
+            logger.info(
+                "Stored Q&A content for suggestions: chat_id=%s, "
+                "user_len=%d, assistant_len=%d",
+                chat.id,
+                len(extracted_user),
+                len(extracted_assistant),
+            )
+        else:
+            logger.debug(
+                "No Q&A content to extract for suggestions: "
+                "assistant_response=%s, user_message=%s",
+                bool(assistant_response),
+                bool(user_message),
+            )
+
     async def query_handler(
         self,
         msgs,
         request: AgentRequest = None,
         **kwargs,
     ):
-        """
-        Handle agent query.
-        """
+        """处理 Agent 查询请求。"""
         logger.debug(
             f"AgentRunner.query_handler called: agent_id={self.agent_id}, "
             f"msgs={msgs}, request={request}",
@@ -743,85 +1484,23 @@ class AgentRunner(Runner):
             f"agent_id={self.agent_id}",
         )
 
-        # Set agent context for model creation
         from ..agent_context import set_current_agent_id
 
         set_current_agent_id(self.agent_id)
 
-        agent = None
+        session_id = request.session_id
+        user_id = request.user_id
+        channel = getattr(request, "channel", DEFAULT_CHANNEL)
+        skip_history = getattr(request, "skip_history", False)
+
+        trace_id = await self._init_trace(request, msgs, session_id)
+
         chat = None
-        session_state_loaded = False
-        trace_id = None
         agent_config = None
-        task_completed = True
-
-        # Initialize tracing context
-        if has_trace_manager():
-            try:
-                trace_mgr = get_trace_manager()
-                if trace_mgr.enabled:
-                    session_id_for_trace = (
-                        getattr(request, "session_id", "") or ""
-                    )
-                    user_id_for_trace = getattr(request, "user_id", "") or ""
-                    channel_for_trace = getattr(
-                        request,
-                        "channel",
-                        DEFAULT_CHANNEL,
-                    )
-                    source_id_for_trace = getattr(
-                        request,
-                        "source_id",
-                        None,
-                    ) or getattr(
-                        request,
-                        "channel_meta",
-                        {},
-                    ).get(
-                        "source_id",
-                        "default",
-                    )
-                    user_message = _get_last_user_text(msgs)
-
-                    # 提取用户名称：先尝试 request 属性，再尝试 request.state
-                    user_name_for_trace = getattr(
-                        request,
-                        "user_name",
-                        None,
-                    ) or getattr(
-                        getattr(request, "state", None),
-                        "user_name",
-                        None,
-                    )
-                    # 提取 BBK 标识符：先尝试 request 属性，再尝试 request.state
-                    bbk_id_for_trace = getattr(
-                        request,
-                        "bbk_id",
-                        None,
-                    ) or getattr(
-                        getattr(request, "state", None),
-                        "bbk_id",
-                        None,
-                    )
-
-                    trace_id = await trace_mgr.start_trace(
-                        user_id=user_id_for_trace,
-                        session_id=session_id_for_trace,
-                        channel=channel_for_trace,
-                        source_id=source_id_for_trace,
-                        user_message=user_message,
-                        user_name=user_name_for_trace,
-                        bbk_id=bbk_id_for_trace,
-                    )
-            except Exception as e:
-                logger.warning("Failed to start trace: %s", e)
+        mcp_clients: list = []
+        state = _RetryState()
 
         try:
-            session_id = request.session_id
-            user_id = request.user_id
-            channel = getattr(request, "channel", DEFAULT_CHANNEL)
-            skip_history = getattr(request, "skip_history", False)
-
             logger.info(
                 "Handle agent query:\n%s",
                 json.dumps(
@@ -848,340 +1527,68 @@ class AgentRunner(Runner):
                 ),
             )
 
-            # Load agent-specific configuration FIRST (needed for MCP config)
             agent_config = load_agent_config(
                 self.agent_id,
                 tenant_id=self.tenant_id,
             )
 
-            # Create MCP clients directly from agent config for this request
-            auth_token = getattr(request, "auth_token", None)
-            cookie_header = getattr(request, "cookie", None)
-            passthrough_headers = dict[str, str](
-                get_current_passthrough_headers() or {},
-            )
-            if cookie_header:
-                passthrough_headers["cookie"] = cookie_header
-            mcp_clients = await _build_and_connect_mcp_clients(
-                agent_config.mcp,
-                passthrough_headers=passthrough_headers or None,
+            mcp_clients = await self._build_mcp_clients_for_request(
+                agent_config,
+                request,
             )
 
-            name = "New Chat"
-            if len(msgs) > 0:
-                content = msgs[0].get_text_content()
-                if content:
-                    name = msgs[0].get_text_content()[:10]
-                else:
-                    name = "Media Message"
-
-            logger.debug(
-                f"DEBUG chat_manager status: "
-                f"_chat_manager={self._chat_manager}, "
-                f"is_none={self._chat_manager is None}, "
-                f"agent_id={self.agent_id}",
-            )
+            name = self._resolve_chat_name(msgs)
 
             turn_id = f"turn-{uuid4().hex}"
-            if self._chat_manager is not None:
-                logger.debug(
-                    f"Runner: Calling get_or_create_chat for "
-                    f"session_id={session_id}, user_id={user_id}, "
-                    f"channel={channel}, name={name}",
-                )
-                chat = await self._chat_manager.get_or_create_chat(
-                    session_id,
-                    user_id,
-                    channel,
-                    name=name,
-                    meta={"agent_id": self.agent_id},
-                )
-                logger.debug(f"Runner: Got chat: {chat.id}")
-                request.channel_meta = {
-                    **(getattr(request, "channel_meta", None) or {}),
-                    "chat_id": chat.id,
-                    "turn_id": turn_id,
-                }
-            else:
-                logger.warning(
-                    f"ChatManager is None! Cannot auto-register chat for "
-                    f"session_id={session_id}",
-                )
+            chat = await self._setup_chat_and_turn(
+                request,
+                session_id,
+                user_id,
+                channel,
+                msgs,
+                name,
+                turn_id,
+            )
 
-            agent = SWEAgent(
+            auth_token = getattr(request, "auth_token", None)
+
+            request_context = self._build_request_context(
+                session_id,
+                user_id,
+                channel,
+                chat,
+                turn_id,
+                self.agent_id,
+                auth_token,
+                approved_tool_call,
+            )
+
+            logger.debug(f"Agent Query msgs {msgs}")
+
+            async for msg, last in self._run_query_with_retry(
                 agent_config=agent_config,
                 env_context=env_context,
                 mcp_clients=mcp_clients,
-                memory_manager=self.memory_manager,
-                request_context={
-                    "session_id": session_id,
-                    "user_id": user_id,
-                    "channel": channel,
-                    "chat_id": chat.id if chat is not None else "",
-                    "turn_id": turn_id,
-                    "agent_id": self.agent_id,
-                    **(
-                        {
-                            "auth_token": auth_token,
-                        }
-                        if auth_token
-                        else {}
-                    ),
-                    **(
-                        {
-                            "forced_tool_call_json": json.dumps(
-                                approved_tool_call,
-                                ensure_ascii=False,
-                            ),
-                        }
-                        if approved_tool_call
-                        else {}
-                    ),
-                },
-                workspace_dir=self.workspace_dir,
-                task_tracker=self._task_tracker,
-            )
-            await agent.register_mcp_clients()
-            agent.set_console_output_enabled(enabled=False)
-
-            # Setup skill detector for tracing
-            if trace_id:
-                await agent.setup_skill_detector(trace_id)
-
-            logger.debug(
-                f"Agent Query msgs {msgs}",
-            )
-
-            _was_cancelled = False
-
-            session_state_loaded = await self.get_state_loaded(
-                agent,
-                session_id,
-                session_state_loaded,
-                skip_history,
-                user_id,
-            )
-
-            # Rebuild system prompt so it always reflects the latest
-            # AGENTS.md / SOUL.md / PROFILE.md, not the stale one saved
-            # in the session state.
-            agent.rebuild_sys_prompt()
-            channel_meta = getattr(request, "channel_meta", {}) or {}
-            resume_id = channel_meta.get("post_turn_validation_resume_id")
-            confirmed_turn_index = 0
-            original_user_message = query or _get_last_user_text(msgs) or ""
-            validation_config = getattr(
-                agent_config.running,
-                "post_turn_validation",
-                None,
-            )
-            task_completed = True
-            if resume_id:
-                pending_continuation = await consume_pending_continuation(
-                    validation_id=resume_id,
-                    session_id=session_id,
-                    tenant_id=self.tenant_id,
-                )
-                if pending_continuation is None:
-                    yield Msg(
-                        name="Friday",
-                        role="assistant",
-                        content="续跑请求已过期或不存在，请重新发起任务。",
-                    ), True
-                    task_completed = False
-                    return
-
-                original_user_message = (
-                    pending_continuation.user_message or original_user_message
-                )
-                confirmed_turn_index = (
-                    pending_continuation.confirmed_turn_index + 1
-                )
-                turn_msgs = [
-                    _build_internal_follow_up_msg(
-                        pending_continuation.follow_up_prompt,
-                    ),
-                ]
-            else:
-                turn_msgs = list(msgs)
-
-            auto_follow_up_turns = 0
-            max_auto_turns = (
-                _resolve_max_auto_turns(validation_config)
-                if validation_config is not None
-                else 0
-            )
-            last_validation_result = None
-
-            while True:
-                async for msg, last in self._enforce_query_timeout(
-                    stream_printing_messages(
-                        agents=[agent],
-                        coroutine_task=agent(turn_msgs),
-                    ),
-                    session_id=session_id,
-                    agent=agent,
-                ):
-                    yield msg, last
-
-                assistant_response = _extract_assistant_response(agent)
-                task_completed = True
-                last_validation_result = None
-                if (
-                    assistant_response
-                    and original_user_message
-                    and validation_config is not None
-                    and getattr(validation_config, "enabled", False)
-                ):
-                    last_validation_result = await validate_task_completion(
-                        user_message=original_user_message,
-                        assistant_response=assistant_response,
-                        agent_id=self.agent_id,
-                        timeout_seconds=getattr(
-                            validation_config,
-                            "timeout_seconds",
-                            8.0,
-                        ),
-                        user_message_max_length=getattr(
-                            validation_config,
-                            "user_message_max_length",
-                            300,
-                        ),
-                        assistant_response_max_length=getattr(
-                            validation_config,
-                            "assistant_response_max_length",
-                            1200,
-                        ),
-                    )
-                    task_completed = last_validation_result.completed
-
-                    if (
-                        not last_validation_result.completed
-                        and last_validation_result.follow_up_prompt
-                        and auto_follow_up_turns < max_auto_turns
-                    ):
-                        auto_follow_up_turns += 1
-                        turn_msgs = [
-                            _build_internal_follow_up_msg(
-                                last_validation_result.follow_up_prompt,
-                            ),
-                        ]
-                        logger.info(
-                            "Post-turn validation scheduled automatic "
-                            "follow-up turn %d/%d for session %s: %s",
-                            auto_follow_up_turns,
-                            max_auto_turns,
-                            session_id,
-                            last_validation_result.reason or "continue",
-                        )
-                        continue
-
-                break
-
-            if (
-                not task_completed
-                and last_validation_result is not None
-                and last_validation_result.follow_up_prompt
+                request_context=request_context,
+                trace_id=trace_id,
+                request=request,
+                session_id=session_id,
+                msgs=msgs,
+                query=query,
+                skip_history=skip_history,
+                user_id=user_id,
+                state=state,
             ):
-                max_confirmed_turns = _resolve_max_confirmed_turns(
-                    validation_config,
-                )
-                if confirmed_turn_index < max_confirmed_turns:
-                    await store_pending_continuation(
-                        session_id=session_id,
-                        user_message=original_user_message,
-                        assistant_response=_extract_assistant_response(agent),
-                        reason=last_validation_result.reason,
-                        follow_up_prompt=last_validation_result.follow_up_prompt,
-                        tenant_id=self.tenant_id,
-                        confirmed_turn_index=confirmed_turn_index,
-                    )
-                    logger.info(
-                        "Post-turn validation pending confirmation after "
-                        "automatic turns %d/%d; confirmed turn %d/%d for "
-                        "session %s: %s",
-                        auto_follow_up_turns,
-                        max_auto_turns,
-                        confirmed_turn_index + 1,
-                        max_confirmed_turns,
-                        session_id,
-                        last_validation_result.reason or "continue",
-                    )
-                else:
-                    logger.info(
-                        "Post-turn validation reached confirmed turn "
-                        "limit %d for session %s",
-                        max_confirmed_turns,
-                        session_id,
-                    )
-
-            suggestions_config = getattr(agent_config.running, "suggestions", None)
-            if (
-                task_completed
-                and suggestions_config is not None
-                and getattr(suggestions_config, "enabled", False)
-                and getattr(suggestions_config, "mode", None)
-                == SuggestionMode.BACKEND_GENERATE
-            ):
-                assistant_response = _extract_assistant_response(agent)
-                if assistant_response and original_user_message:
-                    await _generate_and_store_suggestions(
-                        session_id,
-                        original_user_message,
-                        assistant_response,
-                        suggestions_config,
-                    )
-
-            # 通过 Monitor API 写入 model_output 到 ES
-            if trace_id and agent is not None:
-                logger.debug(
-                    "Preparing to index model output: trace_id=%s, agent=%s",
-                    trace_id,
-                    type(agent).__name__,
-                )
-                assistant_response = _extract_assistant_response(agent)
-                logger.debug(
-                    "Extracted assistant response: trace_id=%s, response_len=%d",
-                    trace_id,
-                    len(assistant_response) if assistant_response else 0,
-                )
-                if assistant_response:
-                    await _index_model_output_to_monitor(
-                        trace_id,
-                        assistant_response,
-                    )
-                else:
-                    logger.warning(
-                        "No assistant response to index: trace_id=%s",
-                        trace_id,
-                    )
-
-            # End trace with success status
-            if trace_id and has_trace_manager():
-                try:
-                    trace_mgr = get_trace_manager()
-                    await trace_mgr.end_trace(
-                        trace_id,
-                        status=TraceStatus.COMPLETED,
-                    )
-                except Exception as trace_err:
-                    logger.warning("Failed to end trace: %s", trace_err)
+                yield msg, last
 
         except asyncio.CancelledError as exc:
-            _was_cancelled = True
             logger.info(f"query_handler: {session_id} cancelled!")
-            # End trace with cancelled status
-            if trace_id and has_trace_manager():
-                try:
-                    trace_mgr = get_trace_manager()
-                    await trace_mgr.end_trace(
-                        trace_id,
-                        status=TraceStatus.CANCELLED,
-                    )
-                except Exception as trace_err:
-                    logger.warning("Failed to end trace: %s", trace_err)
-            if agent is not None:
-                await agent.interrupt()
+            await self._end_trace_if_needed(
+                trace_id,
+                TraceStatus.CANCELLED,
+            )
+            if state.agent is not None:
+                await state.agent.interrupt()
             raise AgentException("Task has been cancelled!") from exc
         except Exception as e:
             debug_dump_path = write_query_error_dump(
@@ -1193,164 +1600,187 @@ class AgentRunner(Runner):
                 f"\n(Details:  {debug_dump_path})" if debug_dump_path else ""
             )
             logger.exception(f"Error in query handler: {e}{path_hint}")
-            # End trace with error status
-            if trace_id and has_trace_manager():
-                try:
-                    trace_mgr = get_trace_manager()
-                    await trace_mgr.end_trace(
-                        trace_id,
-                        status=TraceStatus.ERROR,
-                        error=str(e),
-                    )
-                except Exception as trace_err:
-                    logger.warning("Failed to end trace: %s", trace_err)
-            if debug_dump_path:
-                setattr(e, "debug_dump_path", debug_dump_path)
-                if hasattr(e, "add_note"):
-                    e.add_note(
-                        f"(Details:  {debug_dump_path})",
-                    )
-                suffix = f"\n(Details:  {debug_dump_path})"
-                e.args = (
-                    (f"{e.args[0]}{suffix}" if e.args else suffix.strip()),
-                ) + e.args[1:]
+            await self._handle_query_error(e, trace_id)
+            self._annotate_exception_with_dump(e, debug_dump_path)
             raise
         finally:
-            # INFO 日志确认 finally 块执行
             logger.info(
                 "Runner finally block executing for session %s",
                 session_id,
             )
+            await self._run_safe_cleanup(
+                state.agent,
+                state.session_state_loaded,
+                session_id,
+                skip_history,
+                user_id,
+                chat,
+                mcp_clients,
+            )
+            await self._extract_and_store_qa(
+                agent_config,
+                state.task_completed,
+                state.agent,
+                chat,
+                query,
+            )
 
-            async def _safe_cleanup() -> None:
-                """Safely run cleanup operations, ignoring CancelledError.
+    async def _run_query_with_retry(
+        self,
+        agent_config,
+        env_context,
+        mcp_clients: list,
+        request_context: dict,
+        trace_id: str | None,
+        request: AgentRequest,
+        session_id: str,
+        msgs,
+        query: str | None,
+        skip_history: bool,
+        user_id: str,
+        state: _RetryState,
+    ) -> AsyncGenerator[tuple[Msg, bool], None]:
+        """带重试的查询执行。
 
-                When the outer scope is cancelled, await operations in finally
-                blocks may raise CancelledError due to asyncio checkpoint
-                behavior. These should be suppressed since the task is already
-                being cleaned up.
+        只 yield (msg, last) 消息元组。
+        task_completed / agent / session_state_loaded 通过 state 返回给调用方。
+        """
+        retry_enabled, max_retries, backoff_base, backoff_cap = (
+            self._extract_retry_config(agent_config)
+        )
+        max_retry_attempts = max_retries + 1 if retry_enabled else 1
 
-                Each cleanup step is guarded by an ``asyncio.wait_for`` with
-                ``QUERY_CLEANUP_TIMEOUT`` to prevent a stalled cleanup
-                (e.g. database unreachable) from blocking the request forever.
-                """
-                try:
-                    if agent is not None and session_state_loaded:
-                        await asyncio.wait_for(
-                            self.save_job_session_state(
-                                agent,
-                                session_id,
-                                skip_history,
-                                user_id,
+        for retry_attempt in range(max_retry_attempts):
+            state.agent = None
+            state.session_state_loaded = False
+
+            if retry_attempt > 0:
+                backoff = self._compute_retry_backoff(
+                    retry_attempt,
+                    backoff_cap,
+                    backoff_base,
+                )
+                logger.info(
+                    "Query retry attempt %d/%d, backoff=%.1fs (session=%s)",
+                    retry_attempt,
+                    max_retries,
+                    backoff,
+                    session_id,
+                )
+                yield Msg(
+                    name="Friday",
+                    role="assistant",
+                    content=[
+                        TextBlock(
+                            type="text",
+                            text=(
+                                f"正在重试 ({retry_attempt}/{max_retries})..."
                             ),
-                            timeout=QUERY_CLEANUP_TIMEOUT,
-                        )
-                except asyncio.TimeoutError:
-                    logger.warning(
-                        "Runner finally: session state save timed out "
-                        "(session_id=%s, timeout=%.0fs)",
-                        session_id,
-                        QUERY_CLEANUP_TIMEOUT,
-                    )
-                except asyncio.CancelledError:
-                    logger.debug(
-                        "Runner finally: session state save cancelled (session_id=%s)",
-                        session_id,
-                    )
-                try:
-                    if self._chat_manager is not None and chat is not None:
-                        await asyncio.wait_for(
-                            self._chat_manager.update_chat(chat),
-                            timeout=QUERY_CLEANUP_TIMEOUT,
-                        )
-                except asyncio.TimeoutError:
-                    logger.warning(
-                        "Runner finally: chat update timed out "
-                        "(session_id=%s, timeout=%.0fs)",
-                        session_id,
-                        QUERY_CLEANUP_TIMEOUT,
-                    )
-                except asyncio.CancelledError:
-                    logger.debug(
-                        "Runner finally: chat update cancelled (session_id=%s)",
-                        session_id,
-                    )
-                try:
-                    # Close all MCP clients created for this request
-                    # Check if mcp_clients exists in scope (may not if init failed early)
-                    if "mcp_clients" in locals() and mcp_clients:
-                        await asyncio.wait_for(
-                            _cleanup_mcp_clients(mcp_clients),
-                            timeout=QUERY_CLEANUP_TIMEOUT,
-                        )
-                except asyncio.TimeoutError:
-                    logger.warning(
-                        "Runner finally: MCP cleanup timed out "
-                        "(session_id=%s, timeout=%.0fs)",
-                        session_id,
-                        QUERY_CLEANUP_TIMEOUT,
-                    )
-                except asyncio.CancelledError:
-                    logger.debug(
-                        "Runner finally: MCP cleanup cancelled (session_id=%s)",
-                        session_id,
-                    )
-
-            await _safe_cleanup()
-
-            # === 可插拔式 Q&A 内容提取钩子 ===
-            if (
-                agent_config is not None
-                and task_completed
-                and agent_config.running.suggestions.enabled
-                and agent_config.running.suggestions.mode
-                == SuggestionMode.QA_EXTRACTION_ONLY
-                and chat is not None
-            ):
-                # 提取助手响应文本
-                assistant_response = _extract_assistant_response(agent)
-                user_message = query  # 用户原始问题
-
-                if assistant_response and user_message:
-                    from ..suggestions.service import extract_key_content
-                    from ..suggestions.store import store_qa_content
-
-                    # 提取关键内容
-                    config = agent_config.running.suggestions
-                    extracted_user = user_message[
-                        : config.user_message_max_length
-                    ]
-                    extracted_assistant = extract_key_content(
-                        assistant_response,
-                        max_length=min(
-                            config.qa_content_total_max_length
-                            - len(extracted_user),
-                            config.assistant_response_max_length,
                         ),
-                    )
+                    ],
+                ), False
+                await asyncio.sleep(backoff)
 
-                    # 存储 Q&A 内容（按 chat_id + user_message_hash）
-                    await store_qa_content(
-                        chat_id=chat.id,
-                        user_message=extracted_user,
-                        assistant_response=extracted_assistant,
-                        tenant_id=self.tenant_id,
-                        # max_age_seconds=config.qa_content_max_age_seconds,
-                    )
-                    logger.info(
-                        "Stored Q&A content for suggestions: chat_id=%s, "
-                        "user_len=%d, assistant_len=%d",
-                        chat.id,
-                        len(extracted_user),
-                        len(extracted_assistant),
-                    )
-                else:
-                    logger.debug(
-                        "No Q&A content to extract for suggestions: "
-                        "assistant_response=%s, user_message=%s",
-                        bool(assistant_response),
-                        bool(user_message),
-                    )
+            try:
+                state.agent = await self._create_and_init_agent(
+                    agent_config,
+                    env_context,
+                    mcp_clients,
+                    request_context,
+                    trace_id,
+                    should_setup_skill_detector=(retry_attempt == 0),
+                )
+
+                state.session_state_loaded = await self.get_state_loaded(
+                    state.agent,
+                    session_id,
+                    state.session_state_loaded,
+                    skip_history,
+                    user_id,
+                )
+
+                original_user_message = (
+                    query or _get_last_user_text(msgs) or ""
+                )
+                validation_config = getattr(
+                    agent_config.running,
+                    "post_turn_validation",
+                    None,
+                )
+
+                turn_msgs = list(msgs)
+                confirmed_turn_index = 0
+
+                resume_result = await self._resolve_resume_continuation(
+                    request,
+                    session_id,
+                    original_user_message,
+                )
+                if resume_result is not None:
+                    (
+                        original_user_message,
+                        confirmed_turn_index,
+                        turn_msgs,
+                        expired,
+                    ) = resume_result
+                    if expired:
+                        yield Msg(
+                            name="Friday",
+                            role="assistant",
+                            content="续跑请求已过期或不存在，请重新发起任务。",
+                        ), True
+                        return
+
+                async for item in self._run_single_query_attempt(
+                    agent=state.agent,
+                    turn_msgs=turn_msgs,
+                    session_id=session_id,
+                    agent_config=agent_config,
+                    original_user_message=original_user_message,
+                    validation_config=validation_config,
+                    confirmed_turn_index=confirmed_turn_index,
+                    trace_id=trace_id,
+                    request=request,
+                ):
+                    if isinstance(item[0], bool):
+                        state.task_completed = item[0]
+                    else:
+                        yield item
+
+                break
+            except asyncio.CancelledError:
+                raise
+            except Exception as retry_exc:
+                if not self._should_retry(
+                    retry_attempt,
+                    max_retry_attempts,
+                    retry_exc,
+                ):
+                    raise
+                logger.warning(
+                    "Query failed with retryable error (attempt %d/%d): %s",
+                    retry_attempt + 1,
+                    max_retry_attempts,
+                    retry_exc,
+                )
+                await self._save_state_before_retry(
+                    state.agent,
+                    state.session_state_loaded,
+                    session_id,
+                    skip_history,
+                    user_id,
+                )
+
+    @staticmethod
+    def _should_retry(
+        retry_attempt: int,
+        max_retry_attempts: int,
+        exc: BaseException,
+    ) -> bool:
+        """判断当前异常是否应该重试。"""
+        return retry_attempt < max_retry_attempts - 1 and is_query_retryable(
+            exc,
+        )
 
     async def get_state_loaded(
         self,

@@ -58,12 +58,20 @@ export interface EmbeddingConfig {
   max_batch_size: number;
 }
 
+export interface QueryRetryConfig {
+  enabled: boolean;
+  max_retries: number;
+  backoff_base: number;
+  backoff_cap: number;
+}
+
 export interface AgentsRunningConfig {
   max_iters: number;
   llm_retry_enabled: boolean;
   llm_max_retries: number;
   llm_backoff_base: number;
   llm_backoff_cap: number;
+  query_retry: QueryRetryConfig;
   llm_max_concurrent: number;
   llm_chat_max_concurrent: number | null;
   llm_cron_max_concurrent: number | null;

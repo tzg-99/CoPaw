@@ -389,6 +389,25 @@ QUERY_CLEANUP_TIMEOUT = EnvVarLoader.get_float(
     min_value=5.0,
 )
 
+# 查询级自动重试配置
+# 当 Agent 执行过程中抛出瞬时报错（网络超时、432 Token 限制等）时，
+# 在 query_handler 层自动重试。默认禁用（max_retries=0）。
+QUERY_RETRY_MAX_RETRIES = EnvVarLoader.get_int(
+    "SWE_QUERY_RETRY_MAX_RETRIES",
+    0,
+    min_value=0,
+)
+QUERY_RETRY_BACKOFF_BASE = EnvVarLoader.get_float(
+    "SWE_QUERY_RETRY_BACKOFF_BASE",
+    2.0,
+    min_value=0.5,
+)
+QUERY_RETRY_BACKOFF_CAP = EnvVarLoader.get_float(
+    "SWE_QUERY_RETRY_BACKOFF_CAP",
+    30.0,
+    min_value=1.0,
+)
+
 # Agent interrupt timeout (seconds).
 # Maximum time to wait for the agent to finish after being interrupted.
 AGENT_INTERRUPT_TIMEOUT = EnvVarLoader.get_float(
