@@ -156,7 +156,7 @@ class ImportBuiltinRequest(BaseModel):
 class CreateSkillRequest(BaseModel):
     name: str
     content: str
-    overwrite: bool = False
+    overwrite: bool = True
     references: dict[str, Any] | None = None
     scripts: dict[str, Any] | None = None
     config: dict[str, Any] | None = None
@@ -167,7 +167,7 @@ class UploadToPoolRequest(BaseModel):
     workspace_id: str
     skill_name: str
     new_name: str | None = None
-    overwrite: bool = False
+    overwrite: bool = True
 
 
 class PoolDownloadTarget(BaseModel):
@@ -978,6 +978,7 @@ async def create_pool_skill(
             references=body.references,
             scripts=body.scripts,
             config=body.config,
+            overwrite=body.overwrite,
         )
     except SkillScanError as exc:
         return _scan_error_response(exc)
@@ -1034,7 +1035,7 @@ async def save_pool_skill(
 async def upload_skill_pool_zip(
     request: Request,
     file: UploadFile = File(...),
-    overwrite: bool = False,
+    overwrite: bool = True,
     target_name: str = "",
     rename_map: str = "",
 ) -> dict[str, Any]:

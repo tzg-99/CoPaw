@@ -5,10 +5,12 @@ import styles from "../index.module.less";
 
 interface ContextCompactCardProps {
   maxInputLength: number;
+  extra?: React.ReactNode;
 }
 
 export function ContextCompactCard({
   maxInputLength,
+  extra,
 }: ContextCompactCardProps) {
   const { t } = useTranslation();
 
@@ -33,6 +35,7 @@ export function ContextCompactCard({
       className={styles.formCard}
       title={t("agentConfig.contextCompactTitle")}
       style={{ marginTop: 16 }}
+      extra={extra}
     >
       <Form.Item
         label={t("agentConfig.contextCompactEnabled")}

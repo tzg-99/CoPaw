@@ -4,6 +4,9 @@ import type {
   AgentInitRequest,
   AgentsRunningConfig,
   AgentInitResponse,
+  AgentConfigDistributionRequest,
+  AgentConfigDistributionResponse,
+  AgentConfigDistributionTenantListResponse,
 } from "../types/agent";
 
 // Agent API
@@ -93,4 +96,17 @@ export const agentApi = {
       ffmpeg_installed: boolean;
       whisper_installed: boolean;
     }>("/agent/local-whisper-status"),
+
+  listAgentConfigDistributionTenants: () =>
+    request<AgentConfigDistributionTenantListResponse>(
+      "/agent/config/distribution/tenants",
+    ),
+
+  distributeAgentConfig: (
+    payload: AgentConfigDistributionRequest,
+  ) =>
+    request<AgentConfigDistributionResponse>("/agent/config/distribute", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
 };

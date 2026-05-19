@@ -27,7 +27,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass
-from typing import Any, AsyncGenerator
+from typing import Any, AsyncGenerator, Callable, Awaitable
 
 from agentscope.model import ChatModelBase
 from agentscope.model._model_response import ChatResponse
@@ -176,6 +176,9 @@ def _get_anthropic_retryable() -> tuple[type[Exception], ...]:
 
 def _is_retryable(exc: Exception) -> bool:
     """Return *True* if *exc* should trigger a retry."""
+    # CancelledError 永远不重试（用户主动取消）
+    if isinstance(exc, asyncio.CancelledError):
+        return False
     # TimeoutError from our own wait_for / stall detection is retryable
     if isinstance(exc, TimeoutError):
         return True
@@ -299,9 +302,13 @@ class RetryChatModel(ChatModelBase):
         agent_id: str | None = None,
         call_timeout: float = LLM_CALL_TIMEOUT,
         stream_stall_timeout: float = LLM_STREAM_STALL_TIMEOUT,
+        on_retry: (
+            Callable[[int, int, Exception, float], Awaitable[None]] | None
+        ) = None,
     ) -> None:
         super().__init__(model_name=inner.model_name, stream=inner.stream)
         self._inner = inner
+        self._on_retry = on_retry
         self._retry_config = _normalize_retry_config(retry_config)
         self._rate_limit_config = _normalize_rate_limit_config(
             rate_limit_config,
@@ -481,6 +488,11 @@ class RetryChatModel(ChatModelBase):
                     exc,
                     delay,
                 )
+                if self._on_retry:
+                    try:
+                        await self._on_retry(attempt, attempts, exc, delay)
+                    except Exception:
+                        pass  # 回调失败不影响重试逻辑
                 await asyncio.sleep(delay)
 
             finally:
@@ -514,6 +526,11 @@ class RetryChatModel(ChatModelBase):
             exc,
             delay,
         )
+        if self._on_retry:
+            try:
+                await self._on_retry(attempt, max_attempts, exc, delay)
+            except Exception:
+                pass  # 回调失败不影响重试逻辑
         await asyncio.sleep(delay)
 
     async def _acquire_stream_retry_slot(

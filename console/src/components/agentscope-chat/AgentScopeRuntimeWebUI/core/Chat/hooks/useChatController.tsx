@@ -324,8 +324,9 @@ export default function useChatController() {
    * 处理取消
    */
   const handleCancel = useCallback(() => {
+    cancelActiveRequest();
     finishResponse("interrupted", currentQARef.current.activeRequestOwner);
-  }, [finishResponse]);
+  }, [cancelActiveRequest, finishResponse]);
 
   const updatePostTurnValidationStatus = useCallback(
     (

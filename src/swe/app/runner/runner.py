@@ -7,7 +7,7 @@ import json
 import logging
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, AsyncGenerator
@@ -565,8 +565,11 @@ class _RetryState:
     """重试执行期间需要与调用方共享的可变状态。"""
 
     agent: SWEAgent | None = None
+    prev_agent: SWEAgent | None = None
     session_state_loaded: bool = False
+    prev_session_state_loaded: bool = False
     task_completed: bool = True
+    retry_messages: list[Msg] = field(default_factory=list)
 
 
 class AgentRunner(Runner):
@@ -777,6 +780,47 @@ class AgentRunner(Runner):
         except Exception as e:
             logger.warning("Failed to start trace: %s", e)
             return None
+
+    @staticmethod
+    def _summarize_retry_error(exc: BaseException) -> str:
+        """从重试异常中提取用户可读的错误摘要。"""
+        # 检查异常链中的 status_code（可能被包装）
+        for candidate in (
+            exc,
+            getattr(exc, "__cause__", None),
+            getattr(exc, "__context__", None),
+        ):
+            if candidate is None:
+                continue
+            status_code = getattr(candidate, "status_code", None)
+            if status_code is not None:
+                status_messages = {
+                    429: "请求频率超限",
+                    432: "输入Token数已达上限",
+                    433: "服务过载",
+                    500: "服务内部错误",
+                    502: "网关错误",
+                    503: "服务暂不可用",
+                    504: "请求超时",
+                    529: "站点过载",
+                }
+                return status_messages.get(
+                    status_code,
+                    f"服务错误({status_code})",
+                )
+        if isinstance(exc, (TimeoutError, asyncio.TimeoutError)):
+            return "请求超时"
+        if isinstance(
+            exc,
+            (ConnectionError, ConnectionResetError, BrokenPipeError),
+        ):
+            return "网络连接异常"
+        msg = str(exc)
+        if "rate limiter" in msg.lower():
+            return "请求频率超限"
+        if "timed out" in msg.lower():
+            return "请求超时"
+        return "服务暂时不可用"
 
     @staticmethod
     def _extract_retry_config(
@@ -1608,9 +1652,15 @@ class AgentRunner(Runner):
                 "Runner finally block executing for session %s",
                 session_id,
             )
+            # 取消场景下 state.agent 可能为 None（重试循环在 backoff 中被取消），
+            # 回退到 prev_agent 以确保重试消息能随会话状态一起保存
+            cleanup_agent = state.agent or state.prev_agent
+            cleanup_state_loaded = (
+                state.session_state_loaded or state.prev_session_state_loaded
+            )
             await self._run_safe_cleanup(
-                state.agent,
-                state.session_state_loaded,
+                cleanup_agent,
+                cleanup_state_loaded,
                 session_id,
                 skip_history,
                 user_id,
@@ -1620,7 +1670,7 @@ class AgentRunner(Runner):
             await self._extract_and_store_qa(
                 agent_config,
                 state.task_completed,
-                state.agent,
+                cleanup_agent,
                 chat,
                 query,
             )
@@ -1651,6 +1701,9 @@ class AgentRunner(Runner):
         max_retry_attempts = max_retries + 1 if retry_enabled else 1
 
         for retry_attempt in range(max_retry_attempts):
+            # 保存上一次尝试的 agent 引用，用于将重试消息注入其 memory
+            state.prev_agent = state.agent
+            state.prev_session_state_loaded = state.session_state_loaded
             state.agent = None
             state.session_state_loaded = False
 
@@ -1667,7 +1720,7 @@ class AgentRunner(Runner):
                     backoff,
                     session_id,
                 )
-                yield Msg(
+                retry_msg = Msg(
                     name="Friday",
                     role="assistant",
                     content=[
@@ -1678,7 +1731,13 @@ class AgentRunner(Runner):
                             ),
                         ),
                     ],
-                ), False
+                    metadata={"retry_status": True},
+                )
+                state.retry_messages.append(retry_msg)
+                yield retry_msg, False
+                # 立即将重试消息注入上一次尝试的 agent memory
+                if state.prev_agent is not None:
+                    await state.prev_agent.memory.add(retry_msg)
                 await asyncio.sleep(backoff)
 
             try:
@@ -1757,12 +1816,34 @@ class AgentRunner(Runner):
                     retry_exc,
                 ):
                     raise
+                error_summary = self._summarize_retry_error(retry_exc)
                 logger.warning(
-                    "Query failed with retryable error (attempt %d/%d): %s",
+                    "Query failed with retryable error (attempt %d/%d): %s "
+                    "(summary: %s)",
                     retry_attempt + 1,
                     max_retry_attempts,
                     retry_exc,
+                    error_summary,
                 )
+                retry_msg = Msg(
+                    name="Friday",
+                    role="assistant",
+                    content=[
+                        TextBlock(
+                            type="text",
+                            text=(
+                                f"{error_summary}，"
+                                f"正在重试 ({retry_attempt + 1}/{max_retries})..."
+                            ),
+                        ),
+                    ],
+                    metadata={"retry_status": True},
+                )
+                state.retry_messages.append(retry_msg)
+                yield retry_msg, False
+                # 立即将重试消息注入当前 agent memory
+                if state.agent is not None:
+                    await state.agent.memory.add(retry_msg)
                 await self._save_state_before_retry(
                     state.agent,
                     state.session_state_loaded,

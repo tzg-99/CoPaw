@@ -2289,6 +2289,7 @@ class SkillPoolService:
         scripts: dict[str, Any] | None = None,
         extra_files: dict[str, Any] | None = None,
         config: dict[str, Any] | None = None,
+        overwrite: bool = True,
     ) -> str | None:
         _validate_skill_content(content)
         skill_name = _normalize_skill_dir_name(name)
@@ -2299,8 +2300,15 @@ class SkillPoolService:
             working_dir=self.working_dir,
         )
         existing = manifest.get("skills", {}).get(skill_name)
-        if existing is not None or skill_dir.exists():
+        # 同名技能且 overwrite=False 时拒绝
+        if (existing is not None or skill_dir.exists()) and not overwrite:
             return None
+
+        # 覆盖时保留原技能的 config 和 protected
+        existing_config = existing.get("config") if existing else None
+        existing_protected = (
+            existing.get("protected", False) if existing else False
+        )
 
         with _staged_skill_dir(skill_name) as staged_dir:
             _write_skill_to_dir(
@@ -2315,14 +2323,18 @@ class SkillPoolService:
 
         def _update(payload: dict[str, Any]) -> None:
             payload.setdefault("skills", {})
-            payload["skills"][skill_name] = _build_skill_metadata(
+            entry = _build_skill_metadata(
                 skill_name,
                 skill_dir,
                 source="customized",
-                protected=False,
+                protected=existing_protected,
             )
+            # 优先使用传入 config，其次保留原池 config
             if config is not None:
-                payload["skills"][skill_name]["config"] = dict(config)
+                entry["config"] = dict(config)
+            elif existing_config:
+                entry["config"] = existing_config
+            payload["skills"][skill_name] = entry
 
         _mutate_json(
             get_pool_skill_manifest_path(working_dir=self.working_dir),
@@ -2334,7 +2346,7 @@ class SkillPoolService:
     def import_from_zip(
         self,
         data: bytes,
-        overwrite: bool = False,
+        overwrite: bool = True,
         target_name: str | None = None,
         rename_map: dict[str, str] | None = None,
     ) -> dict[str, Any]:
@@ -2393,7 +2405,8 @@ class SkillPoolService:
                     existing is not None or (pool_dir / skill_name).exists()
                 )
                 is_builtin_entry = _is_pool_builtin_entry(existing)
-                if occupied and (not overwrite or is_builtin_entry):
+                # overwrite=False 时任何冲突均拒绝
+                if occupied and not overwrite:
                     conflicts.append(
                         _build_import_conflict(
                             skill_name,
@@ -2402,12 +2415,6 @@ class SkillPoolService:
                     )
                     continue
                 planned.append((skill_dir, skill_name))
-            if conflicts:
-                return {
-                    "imported": [],
-                    "count": 0,
-                    "conflicts": conflicts,
-                }
             imported: list[str] = []
             for skill_dir, skill_name in planned:
                 if _import_skill_dir(
@@ -2423,12 +2430,25 @@ class SkillPoolService:
                 def _update(payload: dict[str, Any]) -> None:
                     payload.setdefault("skills", {})
                     for name in imported:
-                        payload["skills"][name] = _build_skill_metadata(
+                        # 覆盖时保留原技能的 config 和 protected
+                        old_entry = manifest.get("skills", {}).get(name)
+                        old_config = (
+                            old_entry.get("config") if old_entry else None
+                        )
+                        old_protected = (
+                            old_entry.get("protected", False)
+                            if old_entry
+                            else False
+                        )
+                        entry = _build_skill_metadata(
                             name,
                             pool_dir / name,
                             source="customized",
-                            protected=False,
+                            protected=old_protected,
                         )
+                        if old_config:
+                            entry["config"] = old_config
+                        payload["skills"][name] = entry
 
                 _mutate_json(
                     get_pool_skill_manifest_path(
@@ -2627,7 +2647,7 @@ class SkillPoolService:
         skill_name: str,
         *,
         target_name: str | None = None,
-        overwrite: bool = False,
+        overwrite: bool = True,
     ) -> dict[str, Any]:
         source_dir = get_workspace_skills_dir(workspace_dir) / skill_name
         if not source_dir.exists():
@@ -2642,23 +2662,20 @@ class SkillPoolService:
             working_dir=self.working_dir,
         )
         existing = manifest.get("skills", {}).get(final_name)
-        if existing:
-            if _is_pool_builtin_entry(existing):
-                return {
-                    "success": False,
-                    "reason": "conflict",
-                    "suggested_name": suggest_conflict_name(
-                        final_name,
-                    ),
-                }
-            if not overwrite:
-                return {
-                    "success": False,
-                    "reason": "conflict",
-                    "suggested_name": suggest_conflict_name(
-                        final_name,
-                    ),
-                }
+        if existing and not overwrite:
+            return {
+                "success": False,
+                "reason": "conflict",
+                "suggested_name": suggest_conflict_name(
+                    final_name,
+                ),
+            }
+
+        # 覆盖时保留原技能的 config 和 protected
+        existing_config = existing.get("config") if existing else None
+        existing_protected = (
+            existing.get("protected", False) if existing else False
+        )
 
         with _staged_skill_dir(final_name) as staged_dir:
             _copy_skill_dir(source_dir, staged_dir)
@@ -2678,10 +2695,13 @@ class SkillPoolService:
                 final_name,
                 target_dir,
                 source="customized",
-                protected=False,
+                protected=existing_protected,
             )
+            # 优先使用工作区 config，其次保留原池 config
             if ws_config:
                 entry["config"] = ws_config
+            elif existing_config:
+                entry["config"] = existing_config
             payload["skills"][final_name] = entry
 
         _mutate_json(

@@ -4,10 +4,12 @@ import styles from "../index.module.less";
 
 interface QueryRetryCardProps {
   queryRetryEnabled?: boolean;
+  extra?: React.ReactNode;
 }
 
 export function QueryRetryCard({
   queryRetryEnabled = false,
+  extra,
 }: QueryRetryCardProps) {
   const { t } = useTranslation();
   const form = Form.useFormInstance();
@@ -17,6 +19,7 @@ export function QueryRetryCard({
       className={styles.formCard}
       title={t("agentConfig.queryRetryTitle")}
       style={{ marginTop: 16 }}
+      extra={extra}
     >
       <Form.Item
         name={["query_retry", "enabled"]}
@@ -33,7 +36,7 @@ export function QueryRetryCard({
           name={["query_retry", "max_retries"]}
           rules={[
             {
-              required: true,
+              required: queryRetryEnabled,
               message: t("agentConfig.queryRetryMaxRetriesRequired"),
             },
             {
@@ -59,7 +62,7 @@ export function QueryRetryCard({
           name={["query_retry", "backoff_base"]}
           rules={[
             {
-              required: true,
+              required: queryRetryEnabled,
               message: t("agentConfig.queryRetryBackoffBaseRequired"),
             },
             {
@@ -86,7 +89,7 @@ export function QueryRetryCard({
           dependencies={[["query_retry", "backoff_base"]]}
           rules={[
             {
-              required: true,
+              required: queryRetryEnabled,
               message: t("agentConfig.queryRetryBackoffCapRequired"),
             },
             {
@@ -96,6 +99,7 @@ export function QueryRetryCard({
             },
             {
               validator: async (_, value) => {
+                if (!queryRetryEnabled) return;
                 const backoffBase = form.getFieldValue([
                   "query_retry",
                   "backoff_base",

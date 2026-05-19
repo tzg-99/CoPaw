@@ -20,6 +20,7 @@ interface ReactAgentCardProps {
   timezone: string;
   savingTimezone: boolean;
   onTimezoneChange: (value: string) => void;
+  extra?: React.ReactNode;
 }
 
 export function ReactAgentCard({
@@ -29,10 +30,11 @@ export function ReactAgentCard({
   timezone,
   savingTimezone,
   onTimezoneChange,
+  extra,
 }: ReactAgentCardProps) {
   const { t } = useTranslation();
   return (
-    <Card className={styles.formCard} title={t("agentConfig.reactAgentTitle")}>
+    <Card className={styles.formCard} title={t("agentConfig.reactAgentTitle")} extra={extra}>
       <div className={styles.reactAgentRow}>
         <Form.Item
           label={t("agentConfig.language")}

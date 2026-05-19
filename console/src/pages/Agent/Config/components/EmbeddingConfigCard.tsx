@@ -9,7 +9,11 @@ import {
 import { useTranslation } from "react-i18next";
 import styles from "../index.module.less";
 
-export function EmbeddingConfigCard() {
+interface EmbeddingConfigCardProps {
+  extra?: React.ReactNode;
+}
+
+export function EmbeddingConfigCard({ extra }: EmbeddingConfigCardProps) {
   const { t } = useTranslation();
 
   const baseUrl = Form.useWatch(["embedding_config", "base_url"]);
@@ -21,6 +25,7 @@ export function EmbeddingConfigCard() {
       className={styles.formCard}
       title={t("agentConfig.embeddingConfigTitle")}
       style={{ marginTop: 16 }}
+      extra={extra}
     >
       <Alert
         type="warning"

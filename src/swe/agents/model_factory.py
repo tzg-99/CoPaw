@@ -946,6 +946,7 @@ def create_model_and_formatter(
         rate_limit_config=rate_limit_config,
         tenant_id=tenant_id,
         agent_id=resolved_agent_id,
+        on_retry=None,  # 模型层重试回调，后续可通过上下文变量传递事件
     )
 
     return wrapped_model, formatter

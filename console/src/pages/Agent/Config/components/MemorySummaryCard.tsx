@@ -3,7 +3,11 @@ import { useTranslation } from "react-i18next";
 import { SliderWithValue } from "./SliderWithValue";
 import styles from "../index.module.less";
 
-export function MemorySummaryCard() {
+interface MemorySummaryCardProps {
+  extra?: React.ReactNode;
+}
+
+export function MemorySummaryCard({ extra }: MemorySummaryCardProps) {
   const { t } = useTranslation();
 
   return (
@@ -11,6 +15,7 @@ export function MemorySummaryCard() {
       className={styles.formCard}
       title={t("agentConfig.memorySummaryTitle")}
       style={{ marginTop: 16 }}
+      extra={extra}
     >
       <Form.Item
         label={t("agentConfig.memorySummaryEnabled")}

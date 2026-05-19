@@ -11,6 +11,7 @@ import Error from "./Error";
 import { Bubble } from "@/components/agentscope-chat";
 import Actions from "./Actions";
 import Suggestions from "./Suggestions";
+import RetryStatusMessage from "./RetryStatusMessage";
 import PostTurnValidationPrompt from "./PostTurnValidationPrompt";
 // import { Avatar, Flex } from "antd";
 // import { useChatAnywhereOptions } from "../../Context/ChatAnywhereOptionsContext";
@@ -43,8 +44,17 @@ export default function AgentScopeRuntimeResponseCard(props: {
       )} */}
       {messages.map((item) => {
         switch (item.type) {
-          case AgentScopeRuntimeMessageType.MESSAGE:
+          case AgentScopeRuntimeMessageType.MESSAGE: {
+            // 检测重试状态消息，使用专用卡片渲染
+            // SSE 流式路径: metadata.retry_status
+            // 历史加载路径: metadata.metadata.retry_status（后端嵌套）
+            const meta = (item as any).metadata;
+            const retryStatus = meta?.retry_status || meta?.metadata?.retry_status;
+            if (retryStatus) {
+              return <RetryStatusMessage key={item.id} data={item} />;
+            }
             return <Message key={item.id} data={item} />;
+          }
           case AgentScopeRuntimeMessageType.PLUGIN_CALL:
           case AgentScopeRuntimeMessageType.PLUGIN_CALL_OUTPUT:
           case AgentScopeRuntimeMessageType.MCP_CALL:

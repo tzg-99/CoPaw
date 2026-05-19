@@ -1,361 +1,534 @@
 # -*- coding: utf-8 -*-
-"""Tenant-local skill pool regression tests."""
+"""技能池租户隔离与覆盖同步测试。"""
 
-from __future__ import annotations
-
-import sys
 from pathlib import Path
-from types import SimpleNamespace
 
-sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent / "src"))
+import pytest
 
-import swe.config as swe_config
-from swe.agents import skills_hub
-from swe.agents.skills_manager import (
+from src.swe.agents.skills_manager import (
     SkillPoolService,
-    _build_signature,
     get_skill_pool_dir,
+    get_workspace_skill_manifest_path,
     get_workspace_skills_dir,
-    import_builtin_skills,
-    list_workspaces,
-    list_builtin_import_candidates,
+    read_skill_pool_manifest,
     reconcile_pool_manifest,
-    update_single_builtin,
 )
-from swe.app.routers import agents as agents_router
 
 
 def _write_skill(skill_dir: Path, description: str) -> None:
+    """创建一个最小技能目录。"""
     skill_dir.mkdir(parents=True, exist_ok=True)
     (skill_dir / "SKILL.md").write_text(
-        (
-            f"---\nname: {skill_dir.name}\n"
-            f"description: {description}\n---\n"
-        ),
+        f"---\nname: {skill_dir.name}\ndescription: {description}\n---\n",
         encoding="utf-8",
     )
 
 
-def test_skill_pool_service_upload_uses_tenant_pool(tmp_path: Path) -> None:
-    tenant_a_dir = tmp_path / "tenant-a"
-    tenant_b_dir = tmp_path / "tenant-b"
-    workspace_dir = tenant_a_dir / "workspaces" / "alpha"
-    _write_skill(
-        get_workspace_skills_dir(workspace_dir) / "shared",
-        "workspace tenant-a copy",
+# --- 原有租户隔离测试 ---
+
+
+def test_pool_manifest_is_tenant_scoped(tmp_path: Path) -> None:
+    """不同租户的技能池 manifest 互不影响。"""
+    tenant_a = tmp_path / "tenant-a"
+    tenant_b = tmp_path / "tenant-b"
+
+    svc_a = SkillPoolService(working_dir=tenant_a)
+    svc_b = SkillPoolService(working_dir=tenant_b)
+
+    svc_a.create_skill(
+        name="skill-a",
+        content="---\nname: skill-a\ndescription: A\n---\n",
     )
 
-    result = SkillPoolService(working_dir=tenant_a_dir).upload_from_workspace(
-        workspace_dir=workspace_dir,
-        skill_name="shared",
+    manifest_a = read_skill_pool_manifest(
+        reconcile=False,
+        working_dir=tenant_a,
+    )
+    manifest_b = read_skill_pool_manifest(
+        reconcile=False,
+        working_dir=tenant_b,
     )
 
-    assert result == {"success": True, "name": "shared"}
-    assert (tenant_a_dir / "skill_pool" / "shared" / "SKILL.md").read_text(
+    assert "skill-a" in manifest_a.get("skills", {})
+    assert "skill-a" not in manifest_b.get("skills", {})
+
+
+def test_pool_dir_is_tenant_scoped(tmp_path: Path) -> None:
+    """不同租户的技能池目录互不影响。"""
+    tenant_a = tmp_path / "tenant-a"
+    tenant_b = tmp_path / "tenant-b"
+
+    svc_a = SkillPoolService(working_dir=tenant_a)
+    svc_a.create_skill(
+        name="shared-name",
+        content="---\nname: shared-name\ndescription: from A\n---\n",
+    )
+
+    svc_b = SkillPoolService(working_dir=tenant_b)
+    svc_b.create_skill(
+        name="shared-name",
+        content="---\nname: shared-name\ndescription: from B\n---\n",
+    )
+
+    text_a = (tenant_a / "skill_pool" / "shared-name" / "SKILL.md").read_text(
         encoding="utf-8",
-    ).find("workspace tenant-a copy") != -1
-    assert not (tenant_b_dir / "skill_pool" / "shared").exists()
-
-
-def test_skill_pool_service_create_save_delete_are_tenant_scoped(
-    tmp_path: Path,
-) -> None:
-    tenant_a_dir = tmp_path / "tenant-a"
-    tenant_b_dir = tmp_path / "tenant-b"
-    service_a = SkillPoolService(working_dir=tenant_a_dir)
-    service_b = SkillPoolService(working_dir=tenant_b_dir)
-
-    created_a = service_a.create_skill(
-        name="shared",
-        content="---\nname: shared\ndescription: tenant-a\n---\n",
     )
-    created_b = service_b.create_skill(
-        name="shared",
-        content="---\nname: shared\ndescription: tenant-b\n---\n",
+    text_b = (tenant_b / "skill_pool" / "shared-name" / "SKILL.md").read_text(
+        encoding="utf-8",
     )
-    saved = service_a.save_pool_skill(
-        skill_name="shared",
-        content="---\nname: shared\ndescription: tenant-a updated\n---\n",
-    )
-    deleted = service_a.delete_skill("shared")
 
-    assert created_a == "shared"
-    assert created_b == "shared"
-    assert saved == {"success": True, "mode": "edit", "name": "shared"}
-    assert deleted is True
-    assert not (tenant_a_dir / "skill_pool" / "shared").exists()
-    assert (tenant_b_dir / "skill_pool" / "shared").exists()
+    assert "from A" in text_a
+    assert "from B" in text_b
 
 
-def test_skill_pool_service_download_reads_tenant_local_pool(
-    tmp_path: Path,
-) -> None:
-    tenant_a_dir = tmp_path / "tenant-a"
-    tenant_b_dir = tmp_path / "tenant-b"
-    workspace_dir = tenant_a_dir / "workspaces" / "target"
+def test_upload_from_workspace_is_tenant_scoped(tmp_path: Path) -> None:
+    """upload_from_workspace 写入租户自己的技能池。"""
+    tenant_dir = tmp_path / "tenant-a"
+    workspace_dir = tenant_dir / "workspaces" / "alpha"
 
     _write_skill(
-        get_skill_pool_dir(working_dir=tenant_a_dir) / "shared",
-        "tenant-a pool copy",
+        get_workspace_skills_dir(workspace_dir) / "ws-skill",
+        "workspace skill",
     )
-    _write_skill(
-        get_skill_pool_dir(working_dir=tenant_b_dir) / "shared",
-        "tenant-b pool copy",
-    )
-    reconcile_pool_manifest(working_dir=tenant_a_dir)
-    reconcile_pool_manifest(working_dir=tenant_b_dir)
 
-    result = SkillPoolService(
-        working_dir=tenant_a_dir,
-    ).download_to_workspace(
-        skill_name="shared",
+    svc = SkillPoolService(working_dir=tenant_dir)
+    result = svc.upload_from_workspace(
         workspace_dir=workspace_dir,
+        skill_name="ws-skill",
     )
 
     assert result["success"] is True
-    skill_text = (workspace_dir / "skills" / "shared" / "SKILL.md").read_text(
+    assert (tenant_dir / "skill_pool" / "ws-skill" / "SKILL.md").exists()
+
+
+def test_import_from_zip_is_tenant_scoped(tmp_path: Path) -> None:
+    """import_from_zip 写入租户自己的技能池。"""
+    import io
+    import zipfile
+
+    tenant_dir = tmp_path / "tenant-a"
+    svc = SkillPoolService(working_dir=tenant_dir)
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr(
+            "zip-skill/SKILL.md",
+            "---\nname: zip-skill\ndescription: from zip\n---\n",
+        )
+    data = buf.getvalue()
+
+    result = svc.import_from_zip(data=data)
+
+    assert "zip-skill" in result["imported"]
+    assert (tenant_dir / "skill_pool" / "zip-skill" / "SKILL.md").exists()
+
+
+def test_create_skill_is_tenant_scoped(tmp_path: Path) -> None:
+    """create_skill 写入租户自己的技能池。"""
+    tenant_dir = tmp_path / "tenant-a"
+
+    svc = SkillPoolService(working_dir=tenant_dir)
+    created = svc.create_skill(
+        name="new-skill",
+        content="---\nname: new-skill\ndescription: new\n---\n",
+    )
+
+    assert created == "new-skill"
+    assert (tenant_dir / "skill_pool" / "new-skill" / "SKILL.md").exists()
+
+
+def test_download_to_workspace_is_tenant_scoped(tmp_path: Path) -> None:
+    """download_to_workspace 从租户自己的技能池读取。"""
+    tenant_dir = tmp_path / "tenant-a"
+    workspace_dir = tenant_dir / "workspaces" / "alpha"
+
+    svc = SkillPoolService(working_dir=tenant_dir)
+    svc.create_skill(
+        name="pool-skill",
+        content="---\nname: pool-skill\ndescription: from pool\n---\n",
+    )
+
+    result = svc.download_to_workspace(
+        workspace_dir=workspace_dir,
+        skill_name="pool-skill",
+    )
+
+    assert result["success"] is True
+    assert (
+        get_workspace_skills_dir(workspace_dir) / "pool-skill" / "SKILL.md"
+    ).exists()
+
+
+def test_reconcile_pool_manifest_is_tenant_scoped(tmp_path: Path) -> None:
+    """reconcile_pool_manifest 只影响租户自己的 manifest。"""
+    tenant_a = tmp_path / "tenant-a"
+    tenant_b = tmp_path / "tenant-b"
+
+    _write_skill(
+        get_skill_pool_dir(working_dir=tenant_a) / "orphan-a",
+        "orphan A",
+    )
+    _write_skill(
+        get_skill_pool_dir(working_dir=tenant_b) / "orphan-b",
+        "orphan B",
+    )
+
+    reconcile_pool_manifest(working_dir=tenant_a)
+
+    manifest_a = read_skill_pool_manifest(
+        reconcile=False,
+        working_dir=tenant_a,
+    )
+    manifest_b = read_skill_pool_manifest(
+        reconcile=False,
+        working_dir=tenant_b,
+    )
+
+    assert "orphan-a" in manifest_a.get("skills", {})
+    assert "orphan-b" not in manifest_a.get("skills", {})
+    assert "orphan-b" not in manifest_b.get("skills", {})
+
+
+def test_list_pool_skills_is_tenant_scoped(tmp_path: Path) -> None:
+    """list_skills 只返回租户自己的技能。"""
+    tenant_a = tmp_path / "tenant-a"
+    tenant_b = tmp_path / "tenant-b"
+
+    svc_a = SkillPoolService(working_dir=tenant_a)
+    svc_a.create_skill(
+        name="skill-a",
+        content="---\nname: skill-a\ndescription: A\n---\n",
+    )
+
+    svc_b = SkillPoolService(working_dir=tenant_b)
+    svc_b.create_skill(
+        name="skill-b",
+        content="---\nname: skill-b\ndescription: B\n---\n",
+    )
+
+    manifest_a = read_skill_pool_manifest(
+        reconcile=False,
+        working_dir=tenant_a,
+    )
+    manifest_b = read_skill_pool_manifest(
+        reconcile=False,
+        working_dir=tenant_b,
+    )
+
+    assert "skill-a" in manifest_a.get("skills", {})
+    assert "skill-b" not in manifest_a.get("skills", {})
+    assert "skill-b" in manifest_b.get("skills", {})
+    assert "skill-a" not in manifest_b.get("skills", {})
+
+
+def test_upload_overwrite_does_not_affect_other_tenant(tmp_path: Path) -> None:
+    """覆盖更新不影响其他租户的同名技能。"""
+    tenant_a = tmp_path / "tenant-a"
+    tenant_b = tmp_path / "tenant-b"
+
+    svc_a = SkillPoolService(working_dir=tenant_a)
+    svc_a.create_skill(
+        name="shared-name",
+        content="---\nname: shared-name\ndescription: from A\n---\n",
+    )
+
+    svc_b = SkillPoolService(working_dir=tenant_b)
+    svc_b.create_skill(
+        name="shared-name",
+        content="---\nname: shared-name\ndescription: from B\n---\n",
+    )
+
+    # 覆盖 A 的技能
+    svc_a.create_skill(
+        name="shared-name",
+        content="---\nname: shared-name\ndescription: updated A\n---\n",
+    )
+
+    text_a = (tenant_a / "skill_pool" / "shared-name" / "SKILL.md").read_text(
         encoding="utf-8",
     )
-    assert "tenant-a pool copy" in skill_text
-    assert "tenant-b pool copy" not in skill_text
+    text_b = (tenant_b / "skill_pool" / "shared-name" / "SKILL.md").read_text(
+        encoding="utf-8",
+    )
+
+    assert "updated A" in text_a
+    assert "from B" in text_b
 
 
-def test_list_builtin_import_candidates_reads_tenant_manifest(
-    monkeypatch,
+# --- 技能池覆盖同步测试 ---
+
+
+def test_upload_from_workspace_overwrite_preserves_config_and_protected(
     tmp_path: Path,
 ) -> None:
+    """覆盖非内置技能时保留原技能的 config 和 protected。"""
+    import json
+
     tenant_dir = tmp_path / "tenant-a"
+    workspace_dir = tenant_dir / "workspaces" / "alpha"
+    service = SkillPoolService(working_dir=tenant_dir)
+
     _write_skill(
-        get_skill_pool_dir(working_dir=tenant_dir) / "guidance",
-        "tenant builtin copy",
+        get_skill_pool_dir(working_dir=tenant_dir) / "my-skill",
+        "original description",
     )
     reconcile_pool_manifest(working_dir=tenant_dir)
 
     manifest_path = tenant_dir / "skill_pool" / "skill.json"
-    manifest = manifest_path.read_text(encoding="utf-8")
-    manifest = manifest.replace(
-        '"source": "customized"',
-        '"source": "builtin"',
-    )
-    manifest_path.write_text(manifest, encoding="utf-8")
-
-    monkeypatch.setattr(
-        "swe.agents.skills_manager._get_builtin_signatures",
-        lambda: {"guidance": ""},
-    )
-    monkeypatch.setattr(
-        "swe.agents.skills_manager._read_frontmatter_safe",
-        lambda *args, **kwargs: {"description": "Builtin guidance"},
-    )
-
-    result = list_builtin_import_candidates(working_dir=tenant_dir)
-
-    assert result[0]["name"] == "guidance"
-    assert result[0]["current_source"] == "builtin"
-
-
-def test_import_and_update_builtin_skills_are_tenant_scoped(
-    monkeypatch,
-    tmp_path: Path,
-) -> None:
-    tenant_a_dir = tmp_path / "tenant-a"
-    tenant_b_dir = tmp_path / "tenant-b"
-    builtin_root = tmp_path / "builtin-skills"
-    builtin_skill_dir = builtin_root / "guidance"
-    _write_skill(builtin_skill_dir, "builtin guidance v1")
-
-    monkeypatch.setattr(
-        "swe.agents.skills_manager.get_builtin_skills_dir",
-        lambda: builtin_root,
-    )
-    monkeypatch.setattr(
-        "swe.agents.skills_manager._get_builtin_signatures",
-        lambda: {"guidance": _build_signature(builtin_skill_dir)},
-    )
-
-    imported = import_builtin_skills(
-        ["guidance"],
-        working_dir=tenant_a_dir,
-    )
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["skills"]["my-skill"]["config"] = {"key": "value"}
+    manifest["skills"]["my-skill"]["protected"] = True
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
 
     _write_skill(
-        get_skill_pool_dir(working_dir=tenant_a_dir) / "guidance",
-        "tenant-a outdated guidance",
-    )
-    reconcile_pool_manifest(working_dir=tenant_a_dir)
-    _write_skill(
-        get_skill_pool_dir(working_dir=tenant_b_dir) / "guidance",
-        "tenant-b custom guidance",
-    )
-    reconcile_pool_manifest(working_dir=tenant_b_dir)
-
-    manifest_path = tenant_a_dir / "skill_pool" / "skill.json"
-    manifest_text = manifest_path.read_text(encoding="utf-8")
-    manifest_path.write_text(
-        manifest_text.replace(
-            '"source": "customized"',
-            '"source": "builtin"',
-        ),
-        encoding="utf-8",
+        get_workspace_skills_dir(workspace_dir) / "my-skill",
+        "updated description",
     )
 
-    updated = update_single_builtin("guidance", working_dir=tenant_a_dir)
+    result = service.upload_from_workspace(
+        workspace_dir=workspace_dir,
+        skill_name="my-skill",
+    )
 
-    assert imported["imported"] == ["guidance"]
-    assert updated["source"] == "builtin"
-    assert "builtin guidance v1" in (
-        tenant_a_dir / "skill_pool" / "guidance" / "SKILL.md"
+    assert result == {"success": True, "name": "my-skill"}
+
+    skill_text = (
+        tenant_dir / "skill_pool" / "my-skill" / "SKILL.md"
     ).read_text(encoding="utf-8")
-    assert "tenant-b custom guidance" in (
-        tenant_b_dir / "skill_pool" / "guidance" / "SKILL.md"
-    ).read_text(encoding="utf-8")
+    assert "updated description" in skill_text
+
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert manifest["skills"]["my-skill"]["config"] == {"key": "value"}
+    assert manifest["skills"]["my-skill"]["protected"] is True
 
 
-def test_import_pool_skill_from_hub_passes_tenant_working_dir(
-    monkeypatch,
+def test_upload_from_workspace_overwrite_builtin_allowed(
     tmp_path: Path,
 ) -> None:
-    observed: dict[str, Path] = {}
+    """overwrite=True 时内置技能可被覆盖。"""
+    import json
 
-    monkeypatch.setattr(skills_hub, "_is_http_url", lambda value: True)
-    monkeypatch.setattr(
-        skills_hub,
-        "_resolve_bundle_from_url",
-        lambda bundle_url, version: (b"zip", bundle_url),
-    )
-    monkeypatch.setattr(
-        skills_hub,
-        "_normalize_bundle",
-        lambda data: (
-            "hub-skill",
-            "---\nname: hub-skill\ndescription: Imported\n---\n",
-            None,
-            None,
-            None,
-        ),
-    )
-
-    class FakePoolService:
-        def __init__(self, working_dir: Path | None = None):
-            observed["working_dir"] = working_dir
-
-        def create_skill(self, **kwargs):
-            return kwargs["name"]
-
-    monkeypatch.setattr(skills_hub, "SkillPoolService", FakePoolService)
-
-    result = skills_hub.import_pool_skill_from_hub(
-        bundle_url="https://example.com/skill.zip",
-        working_dir=tmp_path / "tenant-a",
-    )
-
-    assert result.name == "hub-skill"
-    assert observed["working_dir"] == tmp_path / "tenant-a"
-
-
-def test_initialize_agent_workspace_seeds_from_tenant_pool(
-    monkeypatch,
-    tmp_path: Path,
-) -> None:
     tenant_dir = tmp_path / "tenant-a"
-    other_tenant_dir = tmp_path / "tenant-b"
-    workspace_dir = tenant_dir / "workspaces" / "agent-1"
+    workspace_dir = tenant_dir / "workspaces" / "alpha"
+    service = SkillPoolService(working_dir=tenant_dir)
 
     _write_skill(
         get_skill_pool_dir(working_dir=tenant_dir) / "guidance",
-        "tenant-a pool guidance",
+        "builtin guidance",
     )
+    reconcile_pool_manifest(working_dir=tenant_dir)
+
+    manifest_path = tenant_dir / "skill_pool" / "skill.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["skills"]["guidance"]["source"] = "builtin"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
     _write_skill(
-        get_skill_pool_dir(working_dir=other_tenant_dir) / "guidance",
-        "tenant-b pool guidance",
+        get_workspace_skills_dir(workspace_dir) / "guidance",
+        "custom guidance",
     )
 
-    monkeypatch.setattr(
-        agents_router,
-        "_ensure_default_heartbeat_md",
-        lambda *args, **kwargs: None,
+    result = service.upload_from_workspace(
+        workspace_dir=workspace_dir,
+        skill_name="guidance",
+        overwrite=True,
     )
 
-    agents_router._initialize_agent_workspace(
-        workspace_dir,
-        SimpleNamespace(language="en"),
-        skill_names=["guidance"],
-        working_dir=tenant_dir,
+    assert result["success"] is True
+    # 覆盖后 source 变为 customized
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert manifest["skills"]["guidance"]["source"] == "customized"
+
+
+def test_upload_from_workspace_overwrite_false_rejected(
+    tmp_path: Path,
+) -> None:
+    """overwrite=False 时同名技能冲突被拒绝。"""
+    tenant_dir = tmp_path / "tenant-a"
+    workspace_dir = tenant_dir / "workspaces" / "alpha"
+    service = SkillPoolService(working_dir=tenant_dir)
+
+    _write_skill(
+        get_skill_pool_dir(working_dir=tenant_dir) / "my-skill",
+        "existing description",
     )
+    reconcile_pool_manifest(working_dir=tenant_dir)
+
+    _write_skill(
+        get_workspace_skills_dir(workspace_dir) / "my-skill",
+        "updated description",
+    )
+
+    result = service.upload_from_workspace(
+        workspace_dir=workspace_dir,
+        skill_name="my-skill",
+        overwrite=False,
+    )
+
+    assert result["success"] is False
+    assert result["reason"] == "conflict"
+
+
+def test_create_skill_overwrite_preserves_config_and_protected(
+    tmp_path: Path,
+) -> None:
+    """覆盖创建时保留原技能的 config 和 protected。"""
+    import json
+
+    tenant_dir = tmp_path / "tenant-a"
+    service = SkillPoolService(working_dir=tenant_dir)
+
+    service.create_skill(
+        name="my-skill",
+        content="---\nname: my-skill\ndescription: original\n---\n",
+        config={"key": "value"},
+    )
+
+    manifest_path = tenant_dir / "skill_pool" / "skill.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["skills"]["my-skill"]["protected"] = True
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    created = service.create_skill(
+        name="my-skill",
+        content="---\nname: my-skill\ndescription: updated\n---\n",
+    )
+
+    assert created == "my-skill"
 
     skill_text = (
-        workspace_dir / "skills" / "guidance" / "SKILL.md"
+        tenant_dir / "skill_pool" / "my-skill" / "SKILL.md"
     ).read_text(encoding="utf-8")
-    assert "tenant-a pool guidance" in skill_text
-    assert "tenant-b pool guidance" not in skill_text
+    assert "updated" in skill_text
+
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert manifest["skills"]["my-skill"]["config"] == {"key": "value"}
+    assert manifest["skills"]["my-skill"]["protected"] is True
 
 
-def test_initialize_agent_workspace_prefers_agent_language(
-    monkeypatch,
+def test_create_skill_overwrite_false_rejected(
     tmp_path: Path,
 ) -> None:
-    workspace_dir = tmp_path / "tenant-a" / "workspaces" / "agent-ru"
+    """overwrite=False 时同名技能创建被拒绝。"""
+    tenant_dir = tmp_path / "tenant-a"
+    service = SkillPoolService(working_dir=tenant_dir)
 
-    monkeypatch.setattr(
-        swe_config,
-        "load_config",
-        lambda: (_ for _ in ()).throw(
-            AssertionError("should not read global config"),
-        ),
+    service.create_skill(
+        name="my-skill",
+        content="---\nname: my-skill\ndescription: original\n---\n",
     )
 
-    agents_router._initialize_agent_workspace(
-        workspace_dir,
-        SimpleNamespace(language="ru"),
+    result = service.create_skill(
+        name="my-skill",
+        content="---\nname: my-skill\ndescription: updated\n---\n",
+        overwrite=False,
     )
 
-    assert "Встроенный" not in (workspace_dir / "AGENTS.md").read_text(
-        encoding="utf-8",
-    )
-    assert "Шаблон рабочей области" in (workspace_dir / "AGENTS.md").read_text(
-        encoding="utf-8",
-    )
+    assert result is None
 
 
-def test_list_workspaces_reads_agent_names_from_tenant_config(
-    monkeypatch,
+def test_create_skill_overwrite_builtin_allowed(
     tmp_path: Path,
 ) -> None:
-    tenant_config_path = tmp_path / "tenant-a" / "config.json"
-    workspace_dir = tmp_path / "tenant-a" / "workspaces" / "shared"
-    observed: dict[str, Path | None] = {}
+    """overwrite=True 时内置技能可被覆盖创建。"""
+    import json
 
-    monkeypatch.setattr(
-        "swe.config.utils.get_tenant_config_path",
-        lambda tenant_id=None: tenant_config_path,
+    tenant_dir = tmp_path / "tenant-a"
+    service = SkillPoolService(working_dir=tenant_dir)
+
+    _write_skill(
+        get_skill_pool_dir(working_dir=tenant_dir) / "guidance",
+        "builtin guidance",
     )
-    monkeypatch.setattr(
-        "swe.config.utils.load_config",
-        lambda path: SimpleNamespace(
-            agents=SimpleNamespace(
-                profiles={
-                    "shared": SimpleNamespace(
-                        workspace_dir=str(workspace_dir),
-                    ),
-                },
-            ),
-        ),
-    )
-    monkeypatch.setattr(
-        "swe.config.config.load_agent_config",
-        lambda agent_id, config_path=None, tenant_id=None: (
-            observed.update({"config_path": config_path})
-            or SimpleNamespace(name="Tenant Shared")
-        ),
+    reconcile_pool_manifest(working_dir=tenant_dir)
+
+    manifest_path = tenant_dir / "skill_pool" / "skill.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["skills"]["guidance"]["source"] = "builtin"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    result = service.create_skill(
+        name="guidance",
+        content="---\nname: guidance\ndescription: custom\n---\n",
+        overwrite=True,
     )
 
-    result = list_workspaces(tenant_id="tenant-a")
+    assert result == "guidance"
+    # 覆盖后 source 变为 customized
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert manifest["skills"]["guidance"]["source"] == "customized"
 
-    assert observed["config_path"] == tenant_config_path
-    assert result == [
-        {
-            "agent_id": "shared",
-            "agent_name": "Tenant Shared",
-            "workspace_dir": str(workspace_dir),
-        },
-    ]
+
+def test_import_from_zip_overwrite_includes_builtin(
+    tmp_path: Path,
+) -> None:
+    """overwrite=True 时内置技能也可被覆盖导入。"""
+    import io
+    import json
+    import zipfile
+
+    tenant_dir = tmp_path / "tenant-a"
+    service = SkillPoolService(working_dir=tenant_dir)
+
+    _write_skill(
+        get_skill_pool_dir(working_dir=tenant_dir) / "custom-skill",
+        "existing custom",
+    )
+    _write_skill(
+        get_skill_pool_dir(working_dir=tenant_dir) / "guidance",
+        "builtin guidance",
+    )
+    reconcile_pool_manifest(working_dir=tenant_dir)
+
+    manifest_path = tenant_dir / "skill_pool" / "skill.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["skills"]["guidance"]["source"] = "builtin"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr(
+            "custom-skill/SKILL.md",
+            "---\nname: custom-skill\ndescription: updated custom\n---\n",
+        )
+        zf.writestr(
+            "guidance/SKILL.md",
+            "---\nname: guidance\ndescription: updated guidance\n---\n",
+        )
+    data = buf.getvalue()
+
+    result = service.import_from_zip(data=data, overwrite=True)
+
+    # 两个技能都应被覆盖导入
+    assert "custom-skill" in result["imported"]
+    assert "guidance" in result["imported"]
+
+
+def test_import_from_zip_overwrite_false_rejected(
+    tmp_path: Path,
+) -> None:
+    """overwrite=False 时任何同名冲突均导致整体拒绝。"""
+    import io
+    import zipfile
+
+    tenant_dir = tmp_path / "tenant-a"
+    service = SkillPoolService(working_dir=tenant_dir)
+
+    _write_skill(
+        get_skill_pool_dir(working_dir=tenant_dir) / "custom-skill",
+        "existing custom",
+    )
+    reconcile_pool_manifest(working_dir=tenant_dir)
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr(
+            "custom-skill/SKILL.md",
+            "---\nname: custom-skill\ndescription: updated custom\n---\n",
+        )
+    data = buf.getvalue()
+
+    result = service.import_from_zip(data=data, overwrite=False)
+
+    assert result["imported"] == []
+    assert len(result["conflicts"]) > 0

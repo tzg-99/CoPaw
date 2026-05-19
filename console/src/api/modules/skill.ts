@@ -229,10 +229,11 @@ export const skillApi = {
     name: string;
     content: string;
     config?: Record<string, unknown>;
+    overwrite?: boolean;
   }) =>
     request<{ created: boolean; name: string }>("/skills/pool/create", {
       method: "POST",
-      body: JSON.stringify(payload),
+      body: JSON.stringify({ ...payload, overwrite: payload.overwrite ?? true }),
     }),
 
   saveSkillPoolSkill: (payload: {
@@ -372,7 +373,7 @@ export const skillApi = {
   }) =>
     request<{ success: boolean; name: string }>("/skills/pool/upload", {
       method: "POST",
-      body: JSON.stringify(payload),
+      body: JSON.stringify({ ...payload, overwrite: payload.overwrite ?? true }),
     }),
 
   downloadSkillPoolSkill: (payload: {
@@ -538,7 +539,7 @@ export const skillApi = {
       rename_map?: Record<string, string>;
     },
   ) =>
-    _uploadZip("/skills/pool/upload-zip", file, options) as Promise<{
+    _uploadZip("/skills/pool/upload-zip", file, { ...options, overwrite: options?.overwrite ?? true }) as Promise<{
       imported: string[];
       count: number;
       conflicts?: Array<{

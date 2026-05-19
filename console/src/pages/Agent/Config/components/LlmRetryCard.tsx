@@ -4,9 +4,13 @@ import styles from "../index.module.less";
 
 interface LlmRetryCardProps {
   llmRetryEnabled?: boolean;
+  extra?: React.ReactNode;
 }
 
-export function LlmRetryCard({ llmRetryEnabled = true }: LlmRetryCardProps) {
+export function LlmRetryCard({
+  llmRetryEnabled = true,
+  extra,
+}: LlmRetryCardProps) {
   const { t } = useTranslation();
   const form = Form.useFormInstance();
 
@@ -15,6 +19,7 @@ export function LlmRetryCard({ llmRetryEnabled = true }: LlmRetryCardProps) {
       className={styles.formCard}
       title={t("agentConfig.llmRetryTitle")}
       style={{ marginTop: 16 }}
+      extra={extra}
     >
       <Form.Item
         name="llm_retry_enabled"

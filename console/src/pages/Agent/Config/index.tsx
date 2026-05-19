@@ -1,4 +1,5 @@
-import { Button, Form } from "@agentscope-ai/design";
+import { Button, Form, Tooltip } from "@agentscope-ai/design";
+import { SendOutlined } from "@ant-design/icons";
 import { useTranslation } from "react-i18next";
 import { useAgentConfig } from "./useAgentConfig.tsx";
 import {
@@ -10,9 +11,22 @@ import {
   ToolResultCompactCard,
   MemorySummaryCard,
   EmbeddingConfigCard,
+  DistributeModal,
 } from "./components";
 import { PageHeader } from "@/components/PageHeader";
 import styles from "./index.module.less";
+
+/** 配置组 key → 中文显示名称映射 */
+const CONFIG_GROUP_LABELS: Record<string, string> = {
+  react_agent: "React Agent 配置",
+  llm_retry: "LLM 重试配置",
+  query_retry: "Query 重试配置",
+  llm_rate_limiter: "LLM 限流配置",
+  context_compact: "上下文压缩配置",
+  tool_result_compact: "工具结果压缩配置",
+  memory_summary: "记忆摘要配置",
+  embedding_config: "Embedding 配置",
+};
 
 function AgentConfigPage() {
   const { t } = useTranslation();
@@ -29,6 +43,12 @@ function AgentConfigPage() {
     handleSave,
     handleLanguageChange,
     handleTimezoneChange,
+    distributeModalOpen,
+    currentConfigGroup,
+    currentConfigGroupLabel,
+    openDistributeModal,
+    closeDistributeModal,
+    canDistribute,
   } = useAgentConfig();
 
   const llmRetryEnabled = Form.useWatch("llm_retry_enabled", form) ?? true;
@@ -72,21 +92,167 @@ function AgentConfigPage() {
               timezone={timezone}
               savingTimezone={savingTimezone}
               onTimezoneChange={handleTimezoneChange}
+              extra={
+                canDistribute ? (
+                  <Tooltip title={t("agentConfig.distributeTooltip")}>
+                    <Button
+                      type="text"
+                      size="small"
+                      icon={<SendOutlined />}
+                      onClick={() =>
+                        openDistributeModal(
+                          "react_agent",
+                          CONFIG_GROUP_LABELS.react_agent,
+                        )
+                      }
+                    />
+                  </Tooltip>
+                ) : null
+              }
             />
 
-            <LlmRetryCard llmRetryEnabled={llmRetryEnabled} />
+            <LlmRetryCard
+              llmRetryEnabled={llmRetryEnabled}
+              extra={
+                canDistribute ? (
+                  <Tooltip title={t("agentConfig.distributeTooltip")}>
+                    <Button
+                      type="text"
+                      size="small"
+                      icon={<SendOutlined />}
+                      onClick={() =>
+                        openDistributeModal(
+                          "llm_retry",
+                          CONFIG_GROUP_LABELS.llm_retry,
+                        )
+                      }
+                    />
+                  </Tooltip>
+                ) : null
+              }
+            />
 
-            <QueryRetryCard queryRetryEnabled={queryRetryEnabled} />
+            <QueryRetryCard
+              queryRetryEnabled={queryRetryEnabled}
+              extra={
+                canDistribute ? (
+                  <Tooltip title={t("agentConfig.distributeTooltip")}>
+                    <Button
+                      type="text"
+                      size="small"
+                      icon={<SendOutlined />}
+                      onClick={() =>
+                        openDistributeModal(
+                          "query_retry",
+                          CONFIG_GROUP_LABELS.query_retry,
+                        )
+                      }
+                    />
+                  </Tooltip>
+                ) : null
+              }
+            />
 
-            <LlmRateLimiterCard />
+            <LlmRateLimiterCard
+              extra={
+                canDistribute ? (
+                  <Tooltip title={t("agentConfig.distributeTooltip")}>
+                    <Button
+                      type="text"
+                      size="small"
+                      icon={<SendOutlined />}
+                      onClick={() =>
+                        openDistributeModal(
+                          "llm_rate_limiter",
+                          CONFIG_GROUP_LABELS.llm_rate_limiter,
+                        )
+                      }
+                    />
+                  </Tooltip>
+                ) : null
+              }
+            />
 
-            <ContextCompactCard maxInputLength={maxInputLength} />
+            <ContextCompactCard
+              maxInputLength={maxInputLength}
+              extra={
+                canDistribute ? (
+                  <Tooltip title={t("agentConfig.distributeTooltip")}>
+                    <Button
+                      type="text"
+                      size="small"
+                      icon={<SendOutlined />}
+                      onClick={() =>
+                        openDistributeModal(
+                          "context_compact",
+                          CONFIG_GROUP_LABELS.context_compact,
+                        )
+                      }
+                    />
+                  </Tooltip>
+                ) : null
+              }
+            />
 
-            <ToolResultCompactCard />
+            <ToolResultCompactCard
+              extra={
+                canDistribute ? (
+                  <Tooltip title={t("agentConfig.distributeTooltip")}>
+                    <Button
+                      type="text"
+                      size="small"
+                      icon={<SendOutlined />}
+                      onClick={() =>
+                        openDistributeModal(
+                          "tool_result_compact",
+                          CONFIG_GROUP_LABELS.tool_result_compact,
+                        )
+                      }
+                    />
+                  </Tooltip>
+                ) : null
+              }
+            />
 
-            <MemorySummaryCard />
+            <MemorySummaryCard
+              extra={
+                canDistribute ? (
+                  <Tooltip title={t("agentConfig.distributeTooltip")}>
+                    <Button
+                      type="text"
+                      size="small"
+                      icon={<SendOutlined />}
+                      onClick={() =>
+                        openDistributeModal(
+                          "memory_summary",
+                          CONFIG_GROUP_LABELS.memory_summary,
+                        )
+                      }
+                    />
+                  </Tooltip>
+                ) : null
+              }
+            />
 
-            <EmbeddingConfigCard />
+            <EmbeddingConfigCard
+              extra={
+                canDistribute ? (
+                  <Tooltip title={t("agentConfig.distributeTooltip")}>
+                    <Button
+                      type="text"
+                      size="small"
+                      icon={<SendOutlined />}
+                      onClick={() =>
+                        openDistributeModal(
+                          "embedding_config",
+                          CONFIG_GROUP_LABELS.embedding_config,
+                        )
+                      }
+                    />
+                  </Tooltip>
+                ) : null
+              }
+            />
           </Form>
         </div>
       </div>
@@ -103,6 +269,14 @@ function AgentConfigPage() {
           {t("common.save")}
         </Button>
       </div>
+
+      <DistributeModal
+        open={distributeModalOpen}
+        configGroup={currentConfigGroup}
+        configGroupLabel={currentConfigGroupLabel}
+        onClose={closeDistributeModal}
+        onSuccess={fetchConfig}
+      />
     </div>
   );
 }

@@ -4,6 +4,8 @@ import { useTranslation } from "react-i18next";
 import api from "../../../api";
 import type { AgentsRunningConfig } from "../../../api/types";
 import { useAppMessage } from "../../../hooks/useAppMessage";
+import { getUserId } from "../../../utils/identity";
+import { useIframeStore } from "../../../stores/iframeStore";
 
 export function useAgentConfig() {
   const { t } = useTranslation();
@@ -120,6 +122,30 @@ export function useAgentConfig() {
     [timezone, t],
   );
 
+  // 分发相关状态
+  const [distributeModalOpen, setDistributeModalOpen] = useState(false);
+  const [currentConfigGroup, setCurrentConfigGroup] = useState("");
+  const [currentConfigGroupLabel, setCurrentConfigGroupLabel] = useState("");
+  const currentTenantId = getUserId();
+  const { manager } = useIframeStore();
+
+  const openDistributeModal = useCallback(
+    (configGroup: string, label: string) => {
+      setCurrentConfigGroup(configGroup);
+      setCurrentConfigGroupLabel(label);
+      setDistributeModalOpen(true);
+    },
+    [],
+  );
+
+  const closeDistributeModal = useCallback(() => {
+    setDistributeModalOpen(false);
+    setCurrentConfigGroup("");
+    setCurrentConfigGroupLabel("");
+  }, []);
+
+  const canDistribute = manager || currentTenantId === "default";
+
   return {
     form,
     loading,
@@ -133,5 +159,11 @@ export function useAgentConfig() {
     handleSave,
     handleLanguageChange,
     handleTimezoneChange,
+    distributeModalOpen,
+    currentConfigGroup,
+    currentConfigGroupLabel,
+    openDistributeModal,
+    closeDistributeModal,
+    canDistribute,
   };
 }

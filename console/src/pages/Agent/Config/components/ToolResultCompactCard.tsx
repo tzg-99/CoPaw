@@ -3,7 +3,11 @@ import { useTranslation } from "react-i18next";
 import { SliderWithValue } from "./SliderWithValue";
 import styles from "../index.module.less";
 
-export function ToolResultCompactCard() {
+interface ToolResultCompactCardProps {
+  extra?: React.ReactNode;
+}
+
+export function ToolResultCompactCard({ extra }: ToolResultCompactCardProps) {
   const { t } = useTranslation();
   const form = Form.useFormInstance();
 
@@ -12,6 +16,7 @@ export function ToolResultCompactCard() {
       className={styles.formCard}
       title={t("agentConfig.toolResultCompactTitle")}
       style={{ marginTop: 16 }}
+      extra={extra}
     >
       <Form.Item
         label={t("agentConfig.toolResultCompactEnabled")}

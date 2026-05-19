@@ -89,3 +89,25 @@ export interface AgentsRunningConfig {
   embedding_config: EmbeddingConfig;
   memory_manager_backend: "remelight";
 }
+
+export interface AgentConfigDistributionRequest {
+  config_groups: string[];
+  target_tenant_ids: string[];
+  overwrite: boolean;
+}
+
+export interface AgentConfigDistributionTenantResult {
+  tenant_id: string;
+  success: boolean;
+  updated_groups: string[];
+  bootstrapped: boolean;
+  error: string;
+}
+
+export interface AgentConfigDistributionResponse {
+  results: AgentConfigDistributionTenantResult[];
+}
+
+export interface AgentConfigDistributionTenantListResponse {
+  tenant_ids: string[];
+}

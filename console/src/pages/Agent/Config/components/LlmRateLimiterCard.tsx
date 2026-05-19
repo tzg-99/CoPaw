@@ -32,7 +32,11 @@ function optionalIntegerRule(message: string) {
   };
 }
 
-export function LlmRateLimiterCard() {
+interface LlmRateLimiterCardProps {
+  extra?: React.ReactNode;
+}
+
+export function LlmRateLimiterCard({ extra }: LlmRateLimiterCardProps) {
   const { t } = useTranslation();
   const form = Form.useFormInstance();
 
@@ -58,6 +62,7 @@ export function LlmRateLimiterCard() {
       className={styles.formCard}
       title={t("agentConfig.llmRateLimiterTitle")}
       style={{ marginTop: 16 }}
+      extra={extra}
     >
       <Form.Item
         label={t("agentConfig.llmMaxConcurrent")}
